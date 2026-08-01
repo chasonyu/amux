@@ -6,6 +6,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::appearance::Appearance;
+
 /// Bright cyan — dux `ansi_cyan` / `#00FFFF`.
 const BRIGHT_CYAN: Color = Color::Rgb(0, 255, 255);
 /// dux `hint_desc_fg`.
@@ -17,6 +19,15 @@ const OVERLAY_BG: Color = Color::Indexed(60); // #5f5f87 slate
 const OVERLAY_SCRIM: Color = Color::Indexed(232); // near-black veil
 const BORDER_NORMAL: Color = Color::Rgb(80, 80, 80);
 const TITLE_MUTED: Color = Color::Rgb(140, 140, 140);
+
+/// omp light `pageBg` / near-white chrome.
+const LIGHT_APP_BG: Color = Color::Rgb(248, 248, 248);
+const LIGHT_TEXT: Color = Color::Rgb(30, 30, 30);
+const LIGHT_BORDER: Color = Color::Rgb(176, 176, 176); // lightGray
+const LIGHT_TITLE_MUTED: Color = Color::Rgb(108, 108, 108); // mediumGray
+const LIGHT_TEAL: Color = Color::Rgb(90, 128, 128); // omp teal
+const LIGHT_OVERLAY_BG: Color = Color::Indexed(254); // near-white panel
+const LIGHT_OVERLAY_SCRIM: Color = Color::Indexed(252); // light veil
 
 #[derive(Debug, Clone)]
 pub struct Theme {
@@ -80,6 +91,12 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
+        Self::dark()
+    }
+}
+
+impl Theme {
+    pub fn dark() -> Self {
         Self {
             app_bg: APP_BG,
             text_fg: Color::Rgb(255, 255, 255),
@@ -136,9 +153,72 @@ impl Default for Theme {
             transcript_meta_fg: Color::Rgb(120, 120, 120),
         }
     }
-}
 
-impl Theme {
+    /// Light chrome ≈ omp `light.json` (`pageBg`, `userMsgBg`, muted grays).
+    pub fn light() -> Self {
+        Self {
+            app_bg: LIGHT_APP_BG,
+            text_fg: LIGHT_TEXT,
+            border_focused: LIGHT_TEAL,
+            border_normal: LIGHT_BORDER,
+            title_focused: LIGHT_TEAL,
+            title_normal: LIGHT_TITLE_MUTED,
+            selection_fg: LIGHT_TEXT,
+            selection_bg: Color::Rgb(208, 208, 224), // selectedBg
+            session_active: Color::Rgb(40, 40, 40),
+            session_detached: Color::Rgb(154, 115, 38), // yellow
+            session_exited: Color::Rgb(118, 118, 118), // dimGray
+            hint_key_fg: LIGHT_TEAL,
+            hint_bracket_fg: LIGHT_TEAL,
+            hint_key_bg: Color::Rgb(232, 232, 232),
+            hint_desc_fg: LIGHT_TITLE_MUTED,
+            hint_dim_key_fg: LIGHT_TEAL,
+            hint_dim_bracket_fg: LIGHT_TEAL,
+            hint_dim_desc_fg: LIGHT_TITLE_MUTED,
+            hint_bar_bg: Color::Rgb(240, 240, 240),
+            overlay_border: LIGHT_TEAL,
+            overlay_bg: LIGHT_OVERLAY_BG,
+            overlay_dim_bg: LIGHT_OVERLAY_SCRIM,
+            overlay_dim_fg: Color::Rgb(118, 118, 118),
+            help_panel_bg: Color::Indexed(255), // white panel
+            help_banner_fg: Color::Rgb(248, 248, 248),
+            help_banner_bg: LIGHT_TEAL,
+            help_body_fg: Color::Rgb(60, 60, 60),
+            help_section_fg: LIGHT_TEAL,
+            input_cursor_fg: Color::Rgb(255, 255, 255),
+            input_cursor_bg: LIGHT_TEXT,
+            input_label_fg: LIGHT_TEXT,
+            status_info_fg: LIGHT_TITLE_MUTED,
+            status_info_bg: Color::Rgb(224, 224, 224), // statusLineBg
+            project_icon: Color::Rgb(84, 125, 167),   // blue
+            status_mode_agent_bg: Color::Rgb(0, 95, 95),
+            status_mode_shell_bg: Color::Rgb(175, 95, 0),
+            status_mode_modal_bg: Color::Rgb(135, 95, 135),
+            status_mode_fg: Color::Rgb(255, 255, 255),
+            status_seg_a_bg: Color::Rgb(220, 220, 220),
+            status_seg_b_bg: Color::Rgb(0, 95, 135), // statusLinePath
+            status_seg_fg: LIGHT_TEXT,
+            status_msg_bg: Color::Rgb(232, 232, 232),
+            status_msg_fg: Color::Rgb(60, 60, 60),
+            status_ws_bg: Color::Rgb(0, 95, 135),
+            status_ws_fg: Color::Rgb(255, 255, 255),
+            // omp light userMsgBg / thinking / toolOutput
+            transcript_user_bg: Color::Rgb(232, 232, 232), // #e8e8e8
+            transcript_user_fg: LIGHT_TEXT,
+            transcript_assistant_fg: LIGHT_TEXT,
+            transcript_tool_fg: Color::Rgb(108, 108, 108), // mediumGray toolOutput
+            transcript_thinking_fg: Color::Rgb(108, 108, 108), // thinkingText
+            transcript_meta_fg: Color::Rgb(118, 118, 118), // dimGray
+        }
+    }
+
+    pub fn for_appearance(appearance: Appearance) -> Self {
+        match appearance {
+            Appearance::Dark => Self::dark(),
+            Appearance::Light => Self::light(),
+        }
+    }
+
     pub fn selection_style(&self) -> Style {
         Style::default()
             .fg(self.selection_fg)
@@ -202,5 +282,24 @@ impl Theme {
         spans.push(self.desc_span("  "));
         spans.push(self.desc_span(desc));
         Line::from(spans)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn light_theme_has_light_app_bg() {
+        let t = Theme::light();
+        // app_bg should be bright-ish (at least one channel high)
+        match t.app_bg {
+            Color::Rgb(r, g, b) => assert!(r as u16 + g as u16 + b as u16 > 500),
+            _ => {}
+        }
+        assert_ne!(
+            Theme::dark().transcript_user_bg,
+            Theme::light().transcript_user_bg
+        );
     }
 }
