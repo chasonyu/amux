@@ -171,21 +171,14 @@ pub fn list_omp_sessions(sessions_root: &Path, cwd: &Path) -> Result<Vec<OmpDisk
             Some(n) => n.to_string(),
             None => continue,
         };
-        let (id, jsonl_path) = if name.ends_with(".jsonl") {
-            let stem = name.trim_end_matches(".jsonl");
-            let id = extract_session_id(stem);
-            (id, path.clone())
-        } else if path.is_dir() {
-            let jsonl = dir.join(format!("{name}.jsonl"));
-            if jsonl.exists() {
-                continue;
-            }
-            (extract_session_id(&name), path.clone())
-        } else {
+        // Only real session files. Orphan artifacts dirs (no sibling `.jsonl`)
+        // used to be listed with Fallback title = uuid after a half-delete.
+        if !name.ends_with(".jsonl") || !path.is_file() {
             continue;
-        };
-
-        if let Some(sess) = read_disk_session(id, &jsonl_path) {
+        }
+        let stem = name.trim_end_matches(".jsonl");
+        let id = extract_session_id(stem);
+        if let Some(sess) = read_disk_session(id, &path) {
             out.push(sess);
         }
     }
@@ -215,17 +208,30 @@ pub fn session_artifacts_dir(session_path: &Path) -> Option<PathBuf> {
 }
 
 /// Delete session jsonl and its sibling artifacts directory (best-effort on dir).
+///
+/// Retries once if a dying omp rewrite recreates the paths (common right after
+/// kill). Prefer calling this only after the live PTY has been fully torn down.
 pub fn delete_session_with_artifacts(session_path: &Path) -> Result<()> {
     let Some(artifacts) = session_artifacts_dir(session_path) else {
         bail!("not an omp session jsonl: {}", session_path.display());
     };
+    remove_session_paths(session_path, &artifacts)?;
+    // Dying omp may recreate an empty/partial session after the first unlink.
+    if session_path.exists() || artifacts.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        remove_session_paths(session_path, &artifacts)?;
+    }
+    Ok(())
+}
+
+fn remove_session_paths(session_path: &Path, artifacts: &Path) -> Result<()> {
     if session_path.exists() {
         fs::remove_file(session_path).with_context(|| {
             format!("remove session file {}", session_path.display())
         })?;
     }
     if artifacts.exists() {
-        fs::remove_dir_all(&artifacts).with_context(|| {
+        fs::remove_dir_all(artifacts).with_context(|| {
             format!("remove artifacts dir {}", artifacts.display())
         })?;
     }
@@ -548,5 +554,27 @@ mod tests {
         delete_session_with_artifacts(&jsonl).unwrap();
         assert!(!jsonl.exists());
         assert!(!artifacts.exists());
+    }
+
+    #[test]
+    fn list_skips_orphan_artifacts_dir_without_jsonl() {
+        let sessions_root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let key = encode_cwd_key(cwd.path());
+        let sess_dir = sessions_root.path().join(&key);
+        fs::create_dir_all(&sess_dir).unwrap();
+
+        // Half-delete leftover: artifacts dir, no sibling jsonl.
+        fs::create_dir_all(sess_dir.join("2026-08-01T00-00-00-000Z_orphanuuid")).unwrap();
+
+        let real = sess_dir.join("2026-08-01T00-00-00-000Z_realid.jsonl");
+        write_title_slot(&real, "Keep Me");
+        let mut f = File::options().append(true).open(&real).unwrap();
+        writeln!(f, r#"{{"type":"session","id":"realid"}}"#).unwrap();
+
+        let list = list_omp_sessions(sessions_root.path(), cwd.path()).unwrap();
+        assert_eq!(list.len(), 1, "orphan dir must not appear as a session");
+        assert_eq!(list[0].title, "Keep Me");
+        assert!(!list[0].id.contains("orphan"));
     }
 }

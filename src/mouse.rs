@@ -85,6 +85,27 @@ pub fn sgr_is_release(seq: &[u8]) -> bool {
     is_sgr_mouse(seq) && seq.last() == Some(&b'm')
 }
 
+/// Wheel notch from an SGR mouse report: `-1` = scroll up (into history),
+/// `+1` = scroll down (toward live). `None` if not a wheel event.
+///
+/// xterm encoding: bit 6 (64) marks wheel; bit 0 selects direction
+/// (`64` up, `65` down). Modifier bits are ignored for direction.
+pub fn sgr_wheel_delta(seq: &[u8]) -> Option<i32> {
+    if !is_sgr_mouse(seq) {
+        return None;
+    }
+    let params = std::str::from_utf8(&seq[3..seq.len() - 1]).ok()?;
+    let cb: u16 = params.split(';').next()?.parse().ok()?;
+    if cb & 64 == 0 {
+        return None;
+    }
+    // Releases (`m`) for wheel are uncommon; ignore them.
+    if seq.last() == Some(&b'm') {
+        return None;
+    }
+    Some(if cb & 1 != 0 { 1 } else { -1 })
+}
+
 /// SGR mouse report is a button press (final `M`, motion bit clear).
 /// Motion/drag reports also end in `M` but set bit 3 of Cb; a press has it
 /// clear. Used to gate the leave-AgentMode button-release on an actual drag.
@@ -107,6 +128,10 @@ pub fn sgr_is_button_press(seq: &[u8]) -> bool {
     let Ok(cb) = cb_s.parse::<u16>() else {
         return false;
     };
+    // Wheel notches also end in `M` with motion bit clear — not a click.
+    if cb & 64 != 0 {
+        return false;
+    }
     // xterm SGR: bit 5 (32) = motion/drag; bit 3 (8) = Alt/Meta modifier.
     // (Was wrongly using 0x08, which treated Alt+click as non-press.)
     cb & 32 == 0
@@ -160,6 +185,14 @@ mod tests {
     }
 
     #[test]
+    fn wheel_delta_up_down() {
+        assert_eq!(sgr_wheel_delta(b"\x1b[<64;10;10M"), Some(-1));
+        assert_eq!(sgr_wheel_delta(b"\x1b[<65;10;10M"), Some(1));
+        assert_eq!(sgr_wheel_delta(b"\x1b[<0;10;10M"), None);
+        assert_eq!(sgr_wheel_delta(b"\x1b[<64;10;10m"), None);
+    }
+
+    #[test]
     fn release_detected_by_final_m() {
         assert!(sgr_is_release(b"\x1b[<0;10;10m"));
         assert!(!sgr_is_release(b"\x1b[<0;10;10M")); // press, not release
@@ -177,6 +210,9 @@ mod tests {
         // release final 'm' is not a press
         assert!(!sgr_is_button_press(b"\x1b[<0;10;10m"));
         assert!(!sgr_is_button_press(b"not a mouse seq"));
+        // Wheel is not a click (must not attach / hit-test).
+        assert!(!sgr_is_button_press(b"\x1b[<64;10;10M"));
+        assert!(!sgr_is_button_press(b"\x1b[<65;10;10M"));
     }
 
     #[test]

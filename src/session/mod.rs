@@ -423,6 +423,23 @@ impl SessionSupervisor {
         }
     }
 
+    /// Kill a live session and wait for the SIGHUP→SIGTERM→SIGKILL ladder
+    /// (and flock release) before returning. Use before deleting its jsonl so
+    /// a dying omp cannot recreate the file under us.
+    pub fn close_session_blocking(&mut self, id: &str) {
+        if let Some(mut entry) = self.live.remove(id) {
+            entry.pty.kill_process_group();
+            drop(entry.lock.take());
+        }
+    }
+
+    /// Join any detached kill threads from [`Self::close_session`].
+    pub fn join_pending_kills(&mut self) {
+        for handle in std::mem::take(&mut self.kill_threads) {
+            let _ = handle.join();
+        }
+    }
+
     /// Live session ids belonging to `workspace_id` (non-exited).
     pub fn live_ids_for_workspace(&self, workspace_id: &str) -> Vec<String> {
         self.live

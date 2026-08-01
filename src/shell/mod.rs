@@ -38,7 +38,7 @@ use crate::theme::Theme;
 use crate::escape::{EscapeAction, EscapeToggle};
 use crate::mouse::{
     list_row_index, point_in_rect, sgr_has_shift, sgr_is_button_press, sgr_is_release,
-    translate_sgr_mouse_clipped,
+    sgr_wheel_delta, translate_sgr_mouse_clipped,
 };
 use crate::provider::{
     delete_session_with_artifacts, load, refresh_disk_session, render_blocks, RenderedLine,
@@ -50,6 +50,8 @@ use crate::session::{SessionStatus, SessionSummary, SessionSupervisor};
 use crate::workspace::WorkspaceStore;
 
 const TITLE_WATCH_DEBOUNCE: Duration = Duration::from_millis(80);
+/// Wheel notches → emulator history lines.
+const WHEEL_SCROLL_LINES: i32 = 2;
 const TITLE_FALLBACK_POLL: Duration = Duration::from_secs(3);
 
 use self::dir_browser::{draw_dir_browser, BrowserResult, DirBrowser};
@@ -157,6 +159,8 @@ struct TranscriptCache {
     mtime: DateTime<Utc>,
     size: u64,
     blocks: Vec<TranscriptBlock>,
+    /// Lines above the bottom edge currently scrolled away (0 = pinned to tail).
+    scroll_from_bottom: usize,
 }
 
 impl App {
@@ -673,9 +677,10 @@ impl App {
                 }
             }
 
-            // Mouse: shift yield; in-pane → forward only if child wants mouse;
-            // sidebar press → Nav/select. Host always keeps 1000+1006 so chrome
-            // clicks work even when omp has not enabled mouse.
+            // Mouse: shift yield; in-pane wheel → scroll PTY history (host);
+            // other in-pane → forward only if child wants mouse; sidebar press
+            // → Nav/select. Host keeps 1000+1006 so chrome clicks work even
+            // when the child has not enabled mouse.
             if is_sgr_mouse(&seq.bytes) {
                 if sgr_has_shift(&seq.bytes) {
                     continue; // outer terminal selection
@@ -697,6 +702,16 @@ impl App {
                     area.width,
                     area.height,
                 ) {
+                    // Host-scroll emulator history (scheme 1). Wheel up → older.
+                    // If alt-screen has no history, fall back to child mouse.
+                    if let Some(wheel) = sgr_wheel_delta(&seq.bytes) {
+                        // Same surface scroll as Nav: history / preview, no focus change.
+                        let scrolled = self.scroll_agent_pane(wheel);
+                        if !scrolled && child_wants_mouse {
+                            self.route_agent_bytes(&translated)?;
+                        }
+                        continue;
+                    }
                     if child_wants_mouse {
                         // Track button-down only when forwarding in-pane (B2).
                         if sgr_is_release(&seq.bytes) {
@@ -711,7 +726,7 @@ impl App {
                         }
                         self.route_agent_bytes(&translated)?;
                     }
-                    // else: child ignored mouse — swallow in-pane events (already Agent)
+                    // else: child ignored mouse — swallow non-wheel in-pane
                 } else if sgr_is_button_press(&seq.bytes) {
                     // Outside PTY inner: sidebar press → Nav/select only.
                     // Do not set mouse_button_down (no fake release on enter_nav).
@@ -849,7 +864,17 @@ impl App {
                 if self.modal.is_some() {
                     continue;
                 }
-                // Nav: shell hit-test on button press only (B1).
+                // Nav: wheel over Agent pane scrolls preview/PTY history — stay in Nav.
+                if let Some(wheel) = sgr_wheel_delta(&seq.bytes) {
+                    if let Some((x, y)) = parse_sgr_xy(&seq.bytes) {
+                        let pty = self.pty_area;
+                        if point_in_rect(x, y, pty.x, pty.y, pty.width, pty.height) {
+                            let _ = self.scroll_agent_pane(wheel);
+                        }
+                    }
+                    continue;
+                }
+                // Nav: shell hit-test on button press only (B1). Left-click still attaches.
                 if sgr_is_button_press(&seq.bytes) {
                     if let Some((x, y)) = parse_sgr_xy(&seq.bytes) {
                         self.dispatch_shell_hit(x, y)?;
@@ -1096,9 +1121,12 @@ impl App {
             self.enter_nav()?;
         }
         let was_live = self.sessions.is_live(id);
+        // Block until kill+flock finish so omp cannot rewrite the jsonl after
+        // unlink (fork/rebind sessions are especially prone to this race).
         if was_live {
-            self.sessions.close_session(id);
+            self.sessions.close_session_blocking(id);
         }
+        self.sessions.join_pending_kills();
         if self.focused_session_id.as_deref() == Some(id) {
             self.focused_session_id = None;
         }
@@ -1762,7 +1790,69 @@ impl App {
             mtime,
             size,
             blocks,
+            scroll_from_bottom: 0,
         });
+    }
+
+    /// Scroll Agent pane content without changing focus (Nav or Agent).
+    /// Live session → PTY history; disk/exited → JSONL preview offset.
+    fn scroll_agent_pane(&mut self, wheel: i32) -> bool {
+        let lines = -wheel * WHEEL_SCROLL_LINES;
+        let Some(summary) = self.session_list.get(self.selected_session).cloned() else {
+            return false;
+        };
+        let live = self
+            .sessions
+            .get(&summary.id)
+            .is_some_and(|pty| !pty.is_exited());
+        if live {
+            return self
+                .sessions
+                .get(&summary.id)
+                .map(|pty| pty.scroll_display_lines(lines))
+                .unwrap_or(false);
+        }
+        self.scroll_transcript_preview(lines, &summary)
+    }
+
+    fn scroll_transcript_preview(&mut self, lines: i32, summary: &SessionSummary) -> bool {
+        let Some(path) = summary.path.clone() else {
+            return false;
+        };
+        self.ensure_transcript_cache(&path, summary.mtime, summary.size, &summary.provider);
+        let h = {
+            let base = self.pty_area.height as usize;
+            let exited = self
+                .sessions
+                .get(&summary.id)
+                .is_some_and(|p| p.is_exited());
+            if exited && base > 1 {
+                base - 1
+            } else {
+                base
+            }
+        };
+        if h == 0 {
+            return false;
+        }
+        let width = self.pty_area.width as usize;
+        let total = {
+            let Some(cache) = self.transcript_cache.as_ref() else {
+                return false;
+            };
+            render_blocks(&cache.blocks, width, &self.theme).len()
+        };
+        let max = total.saturating_sub(h);
+        let Some(cache) = self.transcript_cache.as_mut() else {
+            return false;
+        };
+        let old = cache.scroll_from_bottom.min(max);
+        let new = (old as i32 + lines).clamp(0, max as i32) as usize;
+        if new == old {
+            return false;
+        }
+        cache.scroll_from_bottom = new;
+        true
     }
 
     fn draw_transcript_preview(&self, f: &mut Frame, area: Rect) {
@@ -1776,9 +1866,11 @@ impl App {
         }
         let rendered = render_blocks(&cache.blocks, area.width as usize, t);
         let total = rendered.len();
-        let start = total.saturating_sub(h);
+        let offset = cache.scroll_from_bottom.min(total.saturating_sub(h));
+        let end = total.saturating_sub(offset);
+        let start = end.saturating_sub(h);
         let mut lines: Vec<Line> = Vec::with_capacity(h);
-        for rl in rendered.iter().skip(start) {
+        for rl in rendered.iter().skip(start).take(h) {
             lines.push(rendered_line_to_ratatui(t, rl, area.width));
         }
         // Pad top if fewer lines than height (keep content at bottom like a chat).

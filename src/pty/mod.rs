@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{self, Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
@@ -395,6 +395,21 @@ impl PtySession {
         self.terminal.lock().mirrored_modes()
     }
 
+    /// Scroll the emulator viewport into history (`lines > 0` = older /
+    /// up). Returns `true` if `display_offset` changed (primary buffer with
+    /// scrollback). Alt-screen grids have no history — returns `false`.
+    pub fn scroll_display_lines(&self, lines: i32) -> bool {
+        if lines == 0 {
+            return false;
+        }
+        let mut term = self.terminal.lock();
+        let changed = term.scroll_display_lines(lines);
+        if changed {
+            self.dirty.store(true, Ordering::Release);
+        }
+        changed
+    }
+
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         // Hold the terminal lock across both resizes so the reader thread
         // cannot process data with mismatched PTY/VT dimensions (§4.2.7.3).
@@ -587,6 +602,14 @@ impl TerminalState {
             alt_scroll: m.contains(TermMode::ALTERNATE_SCROLL),
             modify_other_keys: self.modify_other_keys,
         }
+    }
+
+    /// `lines > 0` scrolls toward older history (wheel up).
+    fn scroll_display_lines(&mut self, lines: i32) -> bool {
+        let before = self.term.grid().display_offset();
+        // alacritty: positive Delta increases display_offset (older).
+        self.term.scroll_display(Scroll::Delta(lines));
+        self.term.grid().display_offset() != before
     }
 
     fn snapshot(&self) -> TerminalSnapshot {
@@ -1062,6 +1085,25 @@ mod tests {
             !response.to_ascii_lowercase().contains("c0c0"),
             "must not answer with the old gray stub: {response:?}"
         );
+    }
+
+    #[test]
+    fn scroll_display_lines_moves_into_history() {
+        let mut terminal = TerminalState::new(5, 20, false);
+        // Push enough lines to build primary-buffer scrollback.
+        let mut bump = Vec::new();
+        for i in 0..40 {
+            bump.extend_from_slice(format!("line-{i}\r\n").as_bytes());
+        }
+        let _ = terminal.process(&bump);
+        assert_eq!(terminal.term.grid().display_offset(), 0);
+        assert!(terminal.scroll_display_lines(3));
+        assert_eq!(terminal.term.grid().display_offset(), 3);
+        assert!(terminal.scroll_display_lines(-3));
+        assert_eq!(terminal.term.grid().display_offset(), 0);
+        // Alt screen has no history — scroll is a no-op.
+        let _ = terminal.process(b"\x1b[?1049h");
+        assert!(!terminal.scroll_display_lines(5));
     }
 
     #[test]

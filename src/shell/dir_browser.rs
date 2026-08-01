@@ -425,17 +425,20 @@ fn footer_hint(theme: &Theme, key: &str, desc: &str) -> Vec<Span<'static>> {
 }
 
 fn themed_block<'a>(theme: &Theme, title: &'a str) -> Block<'a> {
+    // Match Help overlay panel (dark Indexed), not confirm-dialog slate.
+    let panel_bg = theme.help_panel_bg;
     Block::default()
         .title(Line::from(Span::styled(
             title,
             Style::default()
-                .fg(theme.input_label_fg)
+                .fg(theme.text_fg)
+                .bg(panel_bg)
                 .add_modifier(Modifier::BOLD),
         )))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.overlay_border))
-        .style(Style::default().bg(theme.overlay_bg))
+        .border_style(Style::default().fg(theme.overlay_border).bg(panel_bg))
+        .style(Style::default().bg(panel_bg).fg(theme.text_fg))
 }
 
 pub fn render_dim_overlay(f: &mut Frame, area: Rect, theme: &Theme, footer_h: u16) {
@@ -558,11 +561,12 @@ pub fn draw_dir_browser(f: &mut Frame, area: Rect, theme: &Theme, browser: &DirB
             .block(input_block)
             .render(filter_area, f.buffer_mut());
 
+        let panel_bg = theme.help_panel_bg;
         let list_block = Block::default()
             .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.overlay_border))
-            .style(Style::default().bg(theme.overlay_bg))
+            .border_style(Style::default().fg(theme.overlay_border).bg(panel_bg))
+            .style(Style::default().bg(panel_bg).fg(theme.text_fg))
             .title_bottom(Line::from(bottom_spans));
         StatefulWidget::render(
             List::new(items)
