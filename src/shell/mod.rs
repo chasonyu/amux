@@ -32,6 +32,7 @@ use ratatui::{Frame, Terminal};
 use signal_hook::consts::signal::{SIGHUP, SIGWINCH};
 use signal_hook::flag as signal_flag;
 
+use crate::appearance::{probe_appearance, Appearance};
 use crate::config::AmuxConfig;
 use crate::theme::Theme;
 use crate::escape::{EscapeAction, EscapeToggle};
@@ -138,6 +139,9 @@ pub struct App {
     last_mouse_x: u16,
     last_mouse_y: u16,
     theme: Theme,
+    /// Host terminal appearance from OSC 11 (startup probe; Mode 2031 later).
+    #[allow(dead_code)]
+    appearance: Appearance,
     /// Watches current workspace omp session dir for title / list changes.
     session_watch: SessionDirWatcher,
     dirty_session_paths: HashSet<PathBuf>,
@@ -174,7 +178,9 @@ impl App {
             focused_session_id: None,
             modal: None,
             status: String::new(),
+            // Overwritten in `run` after OSC 11 probe (before raw/alt screen).
             theme: Theme::default(),
+            appearance: Appearance::Dark,
             total_dropped_keys: 0,
             total_write_drops: 0,
             drop_notice: None,
@@ -208,6 +214,24 @@ impl App {
 
     pub fn run(&mut self) -> Result<()> {
         let mut stdout = io::stdout();
+
+        // OSC 11 appearance probe timing:
+        // - Prefer **before** `enable_raw_mode` so stdin is still cooked and
+        //   the ~200ms poll reply isn't mixed with raw-mode framing.
+        // - Prefer **before** `EnterAlternateScreen` (primary screen) when
+        //   possible; if already in alt screen, querying once still works.
+        // - Fail / timeout → Dark (handled inside `probe_appearance`).
+        {
+            let mut stdin = io::stdin();
+            let appearance = probe_appearance(&mut stdout, &mut stdin);
+            self.appearance = appearance;
+            self.theme = Theme::for_appearance(appearance);
+            tracing::info!(
+                target: "amux",
+                "startup: appearance={appearance:?}"
+            );
+        }
+
         enable_raw_mode().context("enable_raw_mode")?;
 
         // Setup + event loop. Any `?` inside run_inner returns Err here;
