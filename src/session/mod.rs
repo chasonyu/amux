@@ -423,6 +423,26 @@ impl SessionSupervisor {
         }
     }
 
+    /// Live session ids belonging to `workspace_id` (non-exited).
+    pub fn live_ids_for_workspace(&self, workspace_id: &str) -> Vec<String> {
+        self.live
+            .iter()
+            .filter(|(_, e)| e.workspace_id == workspace_id && !e.pty.is_exited())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Close every live session for a workspace. Returns how many were closed.
+    pub fn close_workspace_sessions(&mut self, workspace_id: &str) -> usize {
+        let ids = self.live_ids_for_workspace(workspace_id);
+        let n = ids.len();
+        for id in ids {
+            self.close_session(&id);
+        }
+        self.known_disk_ids.remove(workspace_id);
+        n
+    }
+
     /// Drain host-bound escapes (OSC 52 etc.) for every live session.
     ///
     /// Only bytes from the `focused` session reach the outer terminal;

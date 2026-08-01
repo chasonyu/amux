@@ -65,7 +65,25 @@ enum Focus {
 enum Modal {
     DirBrowser(DirBrowser),
     Help,
-    ConfirmQuit,
+    ConfirmQuit {
+        /// Which button has keyboard focus (`true` = Yes).
+        yes_focused: bool,
+    },
+    /// Remove workspace from `workspaces.json` (omp session files kept).
+    ConfirmRemoveWorkspace {
+        id: String,
+        name: String,
+        live: usize,
+        yes_focused: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmResult {
+    Yes,
+    No,
+    /// Modal stays open (e.g. moved focus between buttons).
+    Keep,
 }
 
 pub struct App {
@@ -858,7 +876,7 @@ impl App {
     fn handle_shell_seq(&mut self, seq: &[u8]) -> Result<()> {
         match seq {
             b"q" | b"Q" => {
-                self.modal = Some(Modal::ConfirmQuit);
+                self.modal = Some(Modal::ConfirmQuit { yes_focused: true });
                 self.focus = Focus::Modal;
             }
             b"?" => {
@@ -871,6 +889,7 @@ impl App {
             b"k" | b"\x1b[A" => self.move_session(-1),
             b"J" => self.move_workspace(1),
             b"K" => self.move_workspace(-1),
+            b"D" => self.open_remove_workspace()?,
             b"\r" | b"\n" => self.attach_selected()?,
             b"x" => {
                 if let Some(s) = self.session_list.get(self.selected_session) {
@@ -900,10 +919,32 @@ impl App {
             Modal::Help => {
                 self.focus = Focus::Nav;
             }
-            Modal::ConfirmQuit => match seq {
-                b"y" | b"Y" => self.should_quit = true,
-                _ => {
-                    self.focus = Focus::Nav;
+            Modal::ConfirmQuit { mut yes_focused } => {
+                match confirm_key(seq, &mut yes_focused) {
+                    ConfirmResult::Yes => self.should_quit = true,
+                    ConfirmResult::No => self.focus = Focus::Nav,
+                    ConfirmResult::Keep => {
+                        self.modal = Some(Modal::ConfirmQuit { yes_focused });
+                        self.focus = Focus::Modal;
+                    }
+                }
+            }
+            Modal::ConfirmRemoveWorkspace {
+                id,
+                name,
+                live,
+                mut yes_focused,
+            } => match confirm_key(seq, &mut yes_focused) {
+                ConfirmResult::Yes => self.confirm_remove_workspace(&id, &name)?,
+                ConfirmResult::No => self.focus = Focus::Nav,
+                ConfirmResult::Keep => {
+                    self.modal = Some(Modal::ConfirmRemoveWorkspace {
+                        id,
+                        name,
+                        live,
+                        yes_focused,
+                    });
+                    self.focus = Focus::Modal;
                 }
             },
             Modal::DirBrowser(browser) => match browser.handle_seq(seq) {
@@ -943,6 +984,59 @@ impl App {
         self.modal = Some(Modal::DirBrowser(DirBrowser::open()));
         self.focus = Focus::Modal;
         self.status.clear();
+        Ok(())
+    }
+
+    fn open_remove_workspace(&mut self) -> Result<()> {
+        let Some(ws) = self.workspaces.list().get(self.selected_ws).cloned() else {
+            self.status = "No workspace to remove".into();
+            return Ok(());
+        };
+        let live = self.sessions.live_ids_for_workspace(&ws.id).len();
+        self.modal = Some(Modal::ConfirmRemoveWorkspace {
+            id: ws.id,
+            name: ws.name,
+            live,
+            yes_focused: true,
+        });
+        self.focus = Focus::Modal;
+        self.status.clear();
+        Ok(())
+    }
+
+    fn confirm_remove_workspace(&mut self, id: &str, name: &str) -> Result<()> {
+        if self.focus == Focus::Agent {
+            self.enter_nav()?;
+        }
+        let closed = self.sessions.close_workspace_sessions(id);
+        if self
+            .focused_session_id
+            .as_ref()
+            .is_some_and(|fid| !self.sessions.is_live(fid))
+        {
+            self.focused_session_id = None;
+        }
+        match self.workspaces.remove(id) {
+            Ok(true) => {
+                if self.selected_ws >= self.workspaces.list().len() {
+                    self.selected_ws = self.workspaces.list().len().saturating_sub(1);
+                }
+                self.selected_session = 0;
+                self.refresh_sessions();
+                self.status = if closed > 0 {
+                    format!("Removed workspace {name} (closed {closed} live)")
+                } else {
+                    format!("Removed workspace {name}")
+                };
+            }
+            Ok(false) => {
+                self.status = format!("Workspace already gone: {name}");
+            }
+            Err(e) => {
+                self.status = format!("remove workspace: {e:#}");
+            }
+        }
+        self.focus = Focus::Nav;
         Ok(())
     }
 
@@ -1598,6 +1692,7 @@ impl App {
                 ("Enter", "attach"),
                 ("j/k", "session"),
                 ("J/K", "workspace"),
+                ("D", "del ws"),
                 ("x", "close"),
                 ("?", "help"),
                 ("q", "quit"),
@@ -1688,15 +1783,38 @@ impl App {
             Modal::Help => {
                 draw_center_box_lines(f, area, &self.theme, " Help ", &help_lines(&self.theme));
             }
-            Modal::ConfirmQuit => {
-                let mut lines = vec![Line::from(self.theme.desc_span(
-                    "Kill all live omp sessions and exit?",
-                ))];
-                lines.push(Line::from(""));
-                let mut row = self.theme.key_badge("y");
-                row.push(self.theme.desc_span(" yes · any other = cancel"));
-                lines.push(Line::from(row));
-                draw_center_box_lines(f, area, &self.theme, " Quit ", &lines);
+            Modal::ConfirmQuit { yes_focused } => {
+                draw_confirm_dialog(
+                    f,
+                    area,
+                    &self.theme,
+                    " Quit ",
+                    &["Kill all live omp sessions and exit amux?"],
+                    *yes_focused,
+                );
+            }
+            Modal::ConfirmRemoveWorkspace {
+                name,
+                live,
+                yes_focused,
+                ..
+            } => {
+                let mut body = vec![
+                    format!("Remove workspace \"{name}\" from amux?"),
+                    "omp files on disk are kept.".into(),
+                ];
+                if *live > 0 {
+                    body.push(format!("Closes {live} live session(s) first."));
+                }
+                let refs: Vec<&str> = body.iter().map(|s| s.as_str()).collect();
+                draw_confirm_dialog(
+                    f,
+                    area,
+                    &self.theme,
+                    " Remove workspace ",
+                    &refs,
+                    *yes_focused,
+                );
             }
             Modal::DirBrowser(browser) => {
                 draw_dir_browser(f, area, &self.theme, browser);
@@ -1710,6 +1828,7 @@ fn help_lines<'a>(t: &'a Theme) -> Vec<Line<'a>> {
     vec![
         t.help_row("Ctrl-\\", "toggle Nav ↔ Agent (double-tap: literal to omp)"),
         t.help_row("a", "add workspace (browser: o add · / search · g path)"),
+        t.help_row("D", "remove workspace (confirm; keeps omp files on disk)"),
         t.help_row("n", "new omp session"),
         t.help_row("Enter", "attach / resume selected session"),
         t.help_row("j/k", "move session · K/J move workspace"),
@@ -1883,6 +2002,7 @@ fn truncate_display(s: &str, max: usize) -> String {
 }
 
 fn draw_center_box_lines(f: &mut Frame, area: Rect, theme: &Theme, title: &str, lines: &[Line]) {
+    // Help / large content: still a roomy overlay.
     let w = (area.width * 70 / 100).clamp(40, 80);
     let h = (area.height * 70 / 100).clamp(12, 30);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
@@ -1908,6 +2028,203 @@ fn draw_center_box_lines(f: &mut Frame, area: Rect, theme: &Theme, title: &str, 
     f.render_widget(
         Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false }),
         inner,
+    );
+}
+
+/// Compact GUI-style confirm: snug box + `[ Yes ]` / `[ No ]` buttons.
+/// Keyboard only — ←/→/Tab move focus, Enter activates, y/n shortcuts.
+fn confirm_key(seq: &[u8], yes_focused: &mut bool) -> ConfirmResult {
+    match seq {
+        b"y" | b"Y" => ConfirmResult::Yes,
+        b"n" | b"N" | b"\x1b" => ConfirmResult::No,
+        b"\r" | b"\n" | b" " => {
+            if *yes_focused {
+                ConfirmResult::Yes
+            } else {
+                ConfirmResult::No
+            }
+        }
+        // Left / Shift-Tab → Yes
+        b"\x1b[D" | b"\x1b[Z" | b"h" | b"H" => {
+            *yes_focused = true;
+            ConfirmResult::Keep
+        }
+        // Right / Tab → No
+        b"\x1b[C" | b"\t" | b"l" | b"L" => {
+            *yes_focused = false;
+            ConfirmResult::Keep
+        }
+        _ => ConfirmResult::No,
+    }
+}
+
+/// 3-row bordered button (╭─╮ / │ label │ / ╰─╯). Focused = filled cyan.
+fn draw_confirm_button(f: &mut Frame, area: Rect, theme: &Theme, label: &str, focused: bool) {
+    if area.width < 5 || area.height < 3 {
+        return;
+    }
+    let (border_fg, fill_bg, label_fg, border_type) = if focused {
+        (
+            theme.selection_bg,
+            theme.selection_bg,
+            theme.selection_fg,
+            BorderType::Double,
+        )
+    } else {
+        (
+            Color::Indexed(245), // gray outline
+            theme.overlay_bg,
+            theme.hint_desc_fg,
+            BorderType::Rounded,
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(border_type)
+        .border_style(Style::default().fg(border_fg).bg(theme.overlay_bg))
+        .style(Style::default().bg(fill_bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    // Center label in the single content row.
+    let label_w = unicode_width::UnicodeWidthStr::width(label) as u16;
+    let pad = inner.width.saturating_sub(label_w) / 2;
+    let line = Line::from(vec![
+        Span::styled(
+            " ".repeat(pad as usize),
+            Style::default().bg(fill_bg),
+        ),
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(label_fg)
+                .bg(fill_bg)
+                .add_modifier(if focused {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().bg(fill_bg)),
+        inner,
+    );
+}
+
+fn draw_confirm_dialog(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    title: &str,
+    body: &[&str],
+    yes_focused: bool,
+) {
+    // Full-screen scrim so the dialog reads as a layer (RGB truecolor is
+    // often ignored under TERM=xterm / WebSSH — panel uses Indexed colors).
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.overlay_dim_bg)),
+        area,
+    );
+
+    let pad = 4u16;
+    let mut content_w = unicode_width::UnicodeWidthStr::width(title.trim()) as u16;
+    for line in body {
+        content_w = content_w.max(unicode_width::UnicodeWidthStr::width(*line) as u16);
+    }
+    // Two 12-wide buttons + gap
+    content_w = content_w.max(28);
+    let w = (content_w + pad + 2).clamp(34, area.width.saturating_sub(4).max(34).min(58));
+    // outer borders(2) + body + gap + button(3) + gap + hint(1) + pad
+    let h = (body.len() as u16)
+        .saturating_add(9)
+        .min(area.height.saturating_sub(2).max(11));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.title_focused)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.overlay_border))
+        .style(Style::default().bg(theme.overlay_bg).fg(theme.text_fg));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.overlay_bg)),
+        inner,
+    );
+
+    let body_h = (body.len() as u16).saturating_add(1).min(inner.height.saturating_sub(5));
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(body_h),
+            Constraint::Length(3), // bordered buttons
+            Constraint::Length(1), // spacer
+            Constraint::Min(1),    // hint
+        ])
+        .split(inner);
+
+    let body_lines: Vec<Line> = body
+        .iter()
+        .map(|s| {
+            Line::from(Span::styled(
+                (*s).to_string(),
+                Style::default()
+                    .fg(theme.text_fg)
+                    .bg(theme.overlay_bg),
+            ))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(body_lines)
+            .style(Style::default().bg(theme.overlay_bg))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+
+    // Center a pair of equal buttons in the button row.
+    const BTN_W: u16 = 12;
+    const BTN_GAP: u16 = 3;
+    let pair_w = BTN_W * 2 + BTN_GAP;
+    let btn_row = chunks[1];
+    let start_x = btn_row.x + btn_row.width.saturating_sub(pair_w) / 2;
+    let yes_rect = Rect {
+        x: start_x,
+        y: btn_row.y,
+        width: BTN_W.min(btn_row.width),
+        height: btn_row.height.min(3),
+    };
+    let no_rect = Rect {
+        x: start_x.saturating_add(BTN_W + BTN_GAP),
+        y: btn_row.y,
+        width: BTN_W.min(btn_row.width.saturating_sub(BTN_W + BTN_GAP)),
+        height: btn_row.height.min(3),
+    };
+    draw_confirm_button(f, yes_rect, theme, "Yes", yes_focused);
+    draw_confirm_button(f, no_rect, theme, "No", !yes_focused);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ←/→ or Tab · Enter confirm · y / n / Esc".to_string(),
+            Style::default()
+                .fg(theme.hint_dim_desc_fg)
+                .bg(theme.overlay_bg),
+        )))
+        .style(Style::default().bg(theme.overlay_bg))
+        .alignment(ratatui::layout::Alignment::Center),
+        chunks[3],
     );
 }
 

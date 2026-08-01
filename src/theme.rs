@@ -11,6 +11,10 @@ const BRIGHT_CYAN: Color = Color::Rgb(0, 255, 255);
 /// dux `hint_desc_fg`.
 const DESC_BRIGHT: Color = Color::Rgb(160, 160, 160);
 const APP_BG: Color = Color::Rgb(20, 20, 20);
+/// Modal panel fill. Prefer 256-color index so WebSSH / `TERM=xterm`
+/// still separates from app_bg when truecolor RGB is ignored.
+const OVERLAY_BG: Color = Color::Indexed(60); // #5f5f87 slate
+const OVERLAY_SCRIM: Color = Color::Indexed(232); // near-black veil
 const BORDER_NORMAL: Color = Color::Rgb(80, 80, 80);
 const TITLE_MUTED: Color = Color::Rgb(140, 140, 140);
 
@@ -90,8 +94,8 @@ impl Default for Theme {
             hint_dim_desc_fg: DESC_BRIGHT,
             hint_bar_bg: Color::Rgb(25, 25, 25),
             overlay_border: BRIGHT_CYAN,
-            overlay_bg: APP_BG,
-            overlay_dim_bg: Color::Rgb(10, 10, 10),
+            overlay_bg: OVERLAY_BG,
+            overlay_dim_bg: OVERLAY_SCRIM,
             overlay_dim_fg: Color::Rgb(128, 128, 128),
             input_cursor_fg: Color::Rgb(0, 0, 0),
             input_cursor_bg: Color::Rgb(255, 255, 255),
