@@ -12,7 +12,6 @@ use crate::appearance::Appearance;
 const BRIGHT_CYAN: Color = Color::Rgb(0, 255, 255);
 /// dux `hint_desc_fg`.
 const DESC_BRIGHT: Color = Color::Rgb(160, 160, 160);
-const APP_BG: Color = Color::Rgb(20, 20, 20);
 /// Modal panel fill. Prefer 256-color index so WebSSH / `TERM=xterm`
 /// still separates from app_bg when truecolor RGB is ignored.
 const OVERLAY_BG: Color = Color::Indexed(60); // #5f5f87 slate
@@ -20,8 +19,6 @@ const OVERLAY_SCRIM: Color = Color::Indexed(232); // near-black veil
 const BORDER_NORMAL: Color = Color::Rgb(80, 80, 80);
 const TITLE_MUTED: Color = Color::Rgb(140, 140, 140);
 
-/// omp light `pageBg` / near-white chrome.
-const LIGHT_APP_BG: Color = Color::Rgb(248, 248, 248);
 const LIGHT_TEXT: Color = Color::Rgb(30, 30, 30);
 const LIGHT_BORDER: Color = Color::Rgb(176, 176, 176); // lightGray
 const LIGHT_TITLE_MUTED: Color = Color::Rgb(108, 108, 108); // mediumGray
@@ -145,7 +142,9 @@ impl Default for Theme {
 impl Theme {
     pub fn dark() -> Self {
         Self {
-            app_bg: APP_BG,
+            // Large fills use Reset so chrome matches the host dark palette
+            // instead of a hard #141414 box around omp.
+            app_bg: Color::Reset,
             text_fg: Color::Rgb(255, 255, 255),
             border_focused: BRIGHT_CYAN,
             border_normal: BORDER_NORMAL,
@@ -158,12 +157,12 @@ impl Theme {
             session_exited: Color::Rgb(100, 100, 100),
             hint_key_fg: BRIGHT_CYAN,
             hint_bracket_fg: BRIGHT_CYAN,
-            hint_key_bg: Color::Rgb(35, 35, 35),
+            hint_key_bg: Color::Indexed(236),
             hint_desc_fg: DESC_BRIGHT,
             hint_dim_key_fg: BRIGHT_CYAN,
             hint_dim_bracket_fg: BRIGHT_CYAN,
             hint_dim_desc_fg: DESC_BRIGHT,
-            hint_bar_bg: Color::Rgb(25, 25, 25),
+            hint_bar_bg: Color::Reset,
             overlay_border: BRIGHT_CYAN,
             overlay_bg: OVERLAY_BG,
             overlay_dim_bg: OVERLAY_SCRIM,
@@ -177,7 +176,7 @@ impl Theme {
             input_cursor_bg: Color::Rgb(255, 255, 255),
             input_label_fg: Color::Rgb(255, 255, 255),
             status_info_fg: Color::Rgb(100, 100, 100),
-            status_info_bg: Color::Rgb(25, 25, 25),
+            status_info_bg: Color::Reset,
             project_icon: Color::Rgb(100, 149, 237),
             status_mode_agent_bg: Color::Rgb(0, 175, 175),
             status_mode_shell_bg: Color::Rgb(215, 175, 0),
@@ -226,10 +225,11 @@ impl Theme {
         }
     }
 
-    /// Light chrome ≈ omp `light.json` (`pageBg`, `userMsgBg`, muted grays).
+    /// Light chrome ≈ omp `light.json` accents; large fills Reset → host page.
     pub fn light() -> Self {
         Self {
-            app_bg: LIGHT_APP_BG,
+            // Match dark: leak host light background instead of a hard #f8f8f8 box.
+            app_bg: Color::Reset,
             text_fg: LIGHT_TEXT,
             border_focused: LIGHT_TEAL,
             border_normal: LIGHT_BORDER,
@@ -242,12 +242,12 @@ impl Theme {
             session_exited: Color::Rgb(118, 118, 118), // dimGray
             hint_key_fg: LIGHT_TEAL,
             hint_bracket_fg: LIGHT_TEAL,
-            hint_key_bg: Color::Rgb(232, 232, 232),
+            hint_key_bg: Color::Indexed(254),
             hint_desc_fg: LIGHT_TITLE_MUTED,
             hint_dim_key_fg: LIGHT_TEAL,
             hint_dim_bracket_fg: LIGHT_TEAL,
             hint_dim_desc_fg: LIGHT_TITLE_MUTED,
-            hint_bar_bg: Color::Rgb(240, 240, 240),
+            hint_bar_bg: Color::Reset,
             overlay_border: LIGHT_TEAL,
             overlay_bg: LIGHT_OVERLAY_BG,
             overlay_dim_bg: LIGHT_OVERLAY_SCRIM,
@@ -261,7 +261,7 @@ impl Theme {
             input_cursor_bg: LIGHT_TEXT,
             input_label_fg: LIGHT_TEXT,
             status_info_fg: LIGHT_TITLE_MUTED,
-            status_info_bg: Color::Rgb(224, 224, 224), // statusLineBg
+            status_info_bg: Color::Reset,
             project_icon: Color::Rgb(84, 125, 167),   // blue
             status_mode_agent_bg: Color::Rgb(0, 95, 95),
             status_mode_shell_bg: Color::Rgb(175, 95, 0),
@@ -387,13 +387,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn light_theme_has_light_app_bg() {
-        let t = Theme::light();
-        // app_bg should be bright-ish (at least one channel high)
-        match t.app_bg {
-            Color::Rgb(r, g, b) => assert!(r as u16 + g as u16 + b as u16 > 500),
-            _ => {}
-        }
+    fn light_theme_leaks_host_app_bg_like_dark() {
+        assert_eq!(Theme::light().app_bg, Color::Reset);
+        assert_eq!(Theme::dark().app_bg, Color::Reset);
         assert_ne!(
             Theme::dark().transcript_user_bg,
             Theme::light().transcript_user_bg

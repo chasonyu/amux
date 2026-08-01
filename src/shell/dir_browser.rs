@@ -441,21 +441,8 @@ fn themed_block<'a>(theme: &Theme, title: &'a str) -> Block<'a> {
         .style(Style::default().bg(panel_bg).fg(theme.text_fg))
 }
 
-pub fn render_dim_overlay(f: &mut Frame, area: Rect, theme: &Theme, footer_h: u16) {
-    let dim_h = area.height.saturating_sub(footer_h);
-    let buf = f.buffer_mut();
-    for y in area.y..area.y + dim_h {
-        for x in area.x..area.x + area.width {
-            let cell = &mut buf[(x, y)];
-            cell.set_fg(theme.overlay_dim_fg);
-            cell.set_bg(theme.overlay_dim_bg);
-        }
-    }
-}
-
 pub fn draw_dir_browser(f: &mut Frame, area: Rect, theme: &Theme, browser: &DirBrowser) {
-    // Status strip is 2 rows (hints + status) — keep undimmed like dux.
-    render_dim_overlay(f, area, theme, 2);
+    // Panel only — no full-screen scrim (host / chrome stay visible around it).
     let popup = centered_rect(72, 70, area);
     f.render_widget(Clear, popup);
 

@@ -20,6 +20,10 @@ use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use ratatui::style::{Color, Modifier};
 
+use crate::appearance::{
+    colorfgbg_env, mode2031_notify_bytes, palette_set_osc, Appearance, HostSurface,
+};
+
 const WRITE_QUEUE_CAP: usize = 256 * 1024;
 const SYNC_POLL_MS: u64 = 16;
 
@@ -136,6 +140,7 @@ impl PtySession {
         cols: u16,
         env_extra: &[(String, String)],
         kitty_keyboard: bool,
+        surface: HostSurface,
     ) -> Result<Self> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
@@ -152,7 +157,7 @@ impl PtySession {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
-        apply_child_env(&mut cmd, env_extra);
+        apply_child_env(&mut cmd, env_extra, surface.appearance);
 
         let child = pair
             .slave
@@ -165,7 +170,12 @@ impl PtySession {
         let reader = pair.master.try_clone_reader().context("clone reader")?;
         let writer = pair.master.take_writer().context("take writer")?;
 
-        let terminal = Arc::new(Mutex::new(TerminalState::new(rows, cols, kitty_keyboard)));
+        let terminal = Arc::new(Mutex::new(TerminalState::new(
+            rows,
+            cols,
+            kitty_keyboard,
+            surface,
+        )));
         let exited = Arc::new(AtomicBool::new(false));
         let dirty = Arc::new(AtomicBool::new(true));
         let ready = Arc::new(AtomicBool::new(false));
@@ -410,6 +420,43 @@ impl PtySession {
         changed
     }
 
+    /// Sync PTY dynamic colors with host surface and notify the child (Mode 2031 DSR)
+    /// so agents like omp re-query OSC 11 and switch their own theme.
+    pub fn set_host_surface(&self, surface: HostSurface) {
+        let appearance = surface.appearance;
+        {
+            let mut term = self.terminal.lock();
+            if term.surface == surface {
+                return;
+            }
+            term.apply_host_surface(surface);
+        }
+        self.dirty.store(true, Ordering::Release);
+        let notify = mode2031_notify_bytes(appearance);
+        let _ = self.enqueue_write_force(&notify);
+    }
+
+    /// Like [`enqueue_write`] but skips the startup ready-gate (host→child theme notify).
+    fn enqueue_write_force(&self, bytes: &[u8]) -> Result<()> {
+        if self.exited.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut q = self.write_tx.lock();
+        match q.enqueue(bytes) {
+            Ok(()) => {
+                drop(q);
+                let _g = self.write_mutex.lock().unwrap();
+                self.write_notify.notify_one();
+                Ok(())
+            }
+            Err(EnqueueErr::Closed) => Ok(()),
+            Err(EnqueueErr::Full) => {
+                self.write_drops.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+    }
+
     pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         // Hold the terminal lock across both resizes so the reader thread
         // cannot process data with mismatched PTY/VT dimensions (§4.2.7.3).
@@ -519,10 +566,11 @@ struct TerminalState {
     cols: u16,
     /// Tracked from raw child output — alacritty_terminal 0.26 ignores CSI > 4.
     modify_other_keys: u8,
+    surface: HostSurface,
 }
 
 impl TerminalState {
-    fn new(rows: u16, cols: u16, kitty_keyboard: bool) -> Self {
+    fn new(rows: u16, cols: u16, kitty_keyboard: bool, surface: HostSurface) -> Self {
         let event_proxy = EventProxy::new(rows, cols);
         let dimensions = TermDimensions::new(rows, cols);
         let config = Config {
@@ -530,14 +578,25 @@ impl TerminalState {
             kitty_keyboard,
             ..Config::default()
         };
-        Self {
+        let mut state = Self {
             term: Term::new(config, &dimensions, event_proxy.clone()),
             parser: Processor::new(),
             event_proxy,
             rows,
             cols,
             modify_other_keys: 0,
-        }
+            surface,
+        };
+        // Seed dynamic FG/BG so child OSC 10/11 queries match host surface.
+        state.apply_host_surface(surface);
+        state
+    }
+
+    fn apply_host_surface(&mut self, surface: HostSurface) {
+        self.surface = surface;
+        let osc = palette_set_osc(surface);
+        // Drive alacritty Handler::set_color (no public colors_mut API).
+        let _ = self.process(&osc);
     }
 
     /// Returns (child_replies, host_outbound).
@@ -546,7 +605,7 @@ impl TerminalState {
         let pending = self.event_proxy.take_pending();
         let mut replies = pending.bytes;
         for req in pending.color_requests {
-            let rgb = resolve_color_request_rgb(req.index, self.term.colors());
+            let rgb = resolve_color_request_rgb(req.index, self.term.colors(), self.surface);
             replies.extend_from_slice((req.formatter)(rgb).as_bytes());
         }
         // ClipboardLoad MUST reply to child (do not swallow)
@@ -667,8 +726,8 @@ impl TerminalState {
                 row: point.line as u16,
                 col: point.column.0 as u16,
                 symbol,
-                fg: convert_color(cell.fg, colors),
-                bg: convert_color(cell.bg, colors),
+                fg: convert_color(cell.fg, colors, self.surface),
+                bg: convert_color(cell.bg, colors, self.surface),
                 modifier,
             });
         }
@@ -795,9 +854,17 @@ impl EventListener for EventProxy {
     }
 }
 
-fn apply_child_env(cmd: &mut CommandBuilder, extra: &[(String, String)]) {
+fn apply_child_env(
+    cmd: &mut CommandBuilder,
+    extra: &[(String, String)],
+    appearance: Appearance,
+) {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // Light only: hint a light host. Dark leaves COLORFGBG alone (pre-sync behavior).
+    if let Some(cfg) = colorfgbg_env(appearance) {
+        cmd.env("COLORFGBG", cfg);
+    }
 
     // Scrub identity / multiplexer vars so child does not assume host capabilities.
     const SCRUB: &[&str] = &[
@@ -827,24 +894,37 @@ fn apply_child_env(cmd: &mut CommandBuilder, extra: &[(String, String)]) {
     }
 
     for (k, v) in extra {
+        // Don't let PI pins clobber the light-theme COLORFGBG we set above.
+        if k == "COLORFGBG" && colorfgbg_env(appearance).is_some() {
+            continue;
+        }
         cmd.env(k, v);
     }
 }
 
-/// Answer OSC color queries with the live palette, else xterm defaults.
+/// Answer OSC color queries with the live palette, else appearance-aware defaults.
 /// A gray `0xc0c0c0` stub here makes agents (omp) invent a broken theme.
 fn resolve_color_request_rgb(
     index: usize,
     palette: &alacritty_terminal::term::color::Colors,
+    surface: HostSurface,
 ) -> Rgb {
     (index < alacritty_terminal::term::color::COUNT)
         .then(|| palette[index])
         .flatten()
-        .or_else(|| default_palette_rgb(index))
-        .unwrap_or(rgb(0x00, 0x00, 0x00))
+        .or_else(|| default_palette_rgb(index, surface))
+        .unwrap_or_else(|| {
+            if index == NamedColor::Background as usize {
+                rgb(surface.bg.0, surface.bg.1, surface.bg.2)
+            } else {
+                rgb(surface.fg.0, surface.fg.1, surface.fg.2)
+            }
+        })
 }
 
-fn default_palette_rgb(index: usize) -> Option<Rgb> {
+fn default_palette_rgb(index: usize, surface: HostSurface) -> Option<Rgb> {
+    let (fr, fg, fb) = surface.fg;
+    let (br, bg, bb) = surface.bg;
     match index {
         0 => Some(rgb(0x00, 0x00, 0x00)),
         1 => Some(rgb(0xcd, 0x00, 0x00)),
@@ -864,9 +944,9 @@ fn default_palette_rgb(index: usize) -> Option<Rgb> {
         15 => Some(rgb(0xff, 0xff, 0xff)),
         16..=231 => Some(xterm_color_cube(index)),
         232..=255 => Some(xterm_grayscale(index)),
-        x if x == NamedColor::Foreground as usize => Some(rgb(0xff, 0xff, 0xff)),
-        x if x == NamedColor::Background as usize => Some(rgb(0x00, 0x00, 0x00)),
-        x if x == NamedColor::Cursor as usize => Some(rgb(0xff, 0xff, 0xff)),
+        x if x == NamedColor::Foreground as usize => Some(rgb(fr, fg, fb)),
+        x if x == NamedColor::Background as usize => Some(rgb(br, bg, bb)),
+        x if x == NamedColor::Cursor as usize => Some(rgb(fr, fg, fb)),
         x if x == NamedColor::DimBlack as usize => Some(rgb(0x00, 0x00, 0x00)),
         x if x == NamedColor::DimRed as usize => Some(rgb(0x80, 0x00, 0x00)),
         x if x == NamedColor::DimGreen as usize => Some(rgb(0x00, 0x80, 0x00)),
@@ -875,7 +955,7 @@ fn default_palette_rgb(index: usize) -> Option<Rgb> {
         x if x == NamedColor::DimMagenta as usize => Some(rgb(0x80, 0x00, 0x80)),
         x if x == NamedColor::DimCyan as usize => Some(rgb(0x00, 0x80, 0x80)),
         x if x == NamedColor::DimWhite as usize => Some(rgb(0x80, 0x80, 0x80)),
-        x if x == NamedColor::BrightForeground as usize => Some(rgb(0xff, 0xff, 0xff)),
+        x if x == NamedColor::BrightForeground as usize => Some(rgb(fr, fg, fb)),
         x if x == NamedColor::DimForeground as usize => Some(rgb(0x80, 0x80, 0x80)),
         _ => None,
     }
@@ -972,22 +1052,46 @@ fn base64_encode(data: &[u8]) -> String {
 fn convert_color(
     color: TermColor,
     palette: &alacritty_terminal::term::color::Colors,
+    surface: HostSurface,
 ) -> Color {
     match color {
         TermColor::Spec(Rgb { r, g, b }) => Color::Rgb(r, g, b),
-        TermColor::Indexed(index) => palette[index as usize]
-            .map(|c| Color::Rgb(c.r, c.g, c.b))
-            .or_else(|| {
-                default_palette_rgb(index as usize).map(|c| Color::Rgb(c.r, c.g, c.b))
-            })
-            .unwrap_or(Color::Indexed(index)),
-        TermColor::Named(named) => palette[named]
-            .map(|c| Color::Rgb(c.r, c.g, c.b))
-            .unwrap_or_else(|| named_color_to_tui(named)),
+        TermColor::Indexed(index) => {
+            // Child-defined OSC 4 slot → concrete RGB.
+            if let Some(c) = palette[index as usize] {
+                return Color::Rgb(c.r, c.g, c.b);
+            }
+            // Both dark and light: keep Indexed so the host ANSI palette remaps
+            // (omp statusline / git colors match the outer terminal theme).
+            Color::Indexed(index)
+        }
+        TermColor::Named(named) => {
+            // Dynamic FG/BG: always the host surface RGB (same as OSC 10/11),
+            // never Reset — Reset vs Spec pageBg was the dual-palette clash.
+            if is_dynamic_named(named) {
+                return named_color_to_tui(named, surface);
+            }
+            palette[named]
+                .map(|c| Color::Rgb(c.r, c.g, c.b))
+                .unwrap_or_else(|| named_color_to_tui(named, surface))
+        }
     }
 }
 
-fn named_color_to_tui(color: NamedColor) -> Color {
+fn is_dynamic_named(color: NamedColor) -> bool {
+    matches!(
+        color,
+        NamedColor::Foreground
+            | NamedColor::Background
+            | NamedColor::Cursor
+            | NamedColor::BrightForeground
+            | NamedColor::DimForeground
+    )
+}
+
+fn named_color_to_tui(color: NamedColor, surface: HostSurface) -> Color {
+    let (fr, fg, fb) = surface.fg;
+    let (br, bg, bb) = surface.bg;
     match color {
         NamedColor::Black => Color::Indexed(0),
         NamedColor::Red => Color::Indexed(1),
@@ -1013,11 +1117,12 @@ fn named_color_to_tui(color: NamedColor) -> Color {
         NamedColor::DimMagenta => Color::Indexed(5),
         NamedColor::DimCyan => Color::Indexed(6),
         NamedColor::DimWhite => Color::Indexed(7),
-        NamedColor::Foreground
-        | NamedColor::Background
-        | NamedColor::Cursor
-        | NamedColor::BrightForeground
-        | NamedColor::DimForeground => Color::Reset,
+        // Same RGB we advertise via OSC 10/11 — keeps omp defaults aligned.
+        NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::Cursor => {
+            Color::Rgb(fr, fg, fb)
+        }
+        NamedColor::Background => Color::Rgb(br, bg, bb),
+        NamedColor::DimForeground => Color::Rgb(0x80, 0x80, 0x80),
     }
 }
 
@@ -1031,6 +1136,7 @@ pub fn smoke_spawn_echo() -> Result<()> {
         80,
         &[],
         false,
+        HostSurface::fallback(Appearance::Dark),
     )?;
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
@@ -1048,49 +1154,64 @@ pub fn smoke_spawn_echo() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn dark_surface() -> HostSurface {
+        HostSurface::fallback(Appearance::Dark)
+    }
+
+    fn light_surface() -> HostSurface {
+        HostSurface::fallback(Appearance::Light)
+    }
+
     #[test]
     fn smoke_echo_pty() {
         smoke_spawn_echo().expect("echo pty smoke");
     }
 
     #[test]
-    fn color_query_fallback_is_xterm_not_gray_stub() {
+    fn color_query_fallback_uses_host_surface() {
         let empty = alacritty_terminal::term::color::Colors::default();
+        let host = HostSurface::from_bg(0x1e, 0x1e, 0x2e);
         assert_eq!(
-            resolve_color_request_rgb(NamedColor::Background as usize, &empty),
-            rgb(0x00, 0x00, 0x00)
+            resolve_color_request_rgb(NamedColor::Background as usize, &empty, host),
+            rgb(0x1e, 0x1e, 0x2e)
         );
         assert_eq!(
-            resolve_color_request_rgb(NamedColor::Foreground as usize, &empty),
-            rgb(0xff, 0xff, 0xff)
+            resolve_color_request_rgb(NamedColor::Foreground as usize, &empty, host),
+            rgb(host.fg.0, host.fg.1, host.fg.2)
         );
-        assert_eq!(resolve_color_request_rgb(1, &empty), rgb(0xcd, 0x00, 0x00));
-        assert_eq!(resolve_color_request_rgb(9, &empty), rgb(0xff, 0x00, 0x00));
         assert_eq!(
-            resolve_color_request_rgb(238, &empty),
+            resolve_color_request_rgb(1, &empty, dark_surface()),
+            rgb(0xcd, 0x00, 0x00)
+        );
+        assert_eq!(
+            resolve_color_request_rgb(238, &empty, dark_surface()),
             xterm_grayscale(238)
         );
     }
 
     #[test]
-    fn osc_background_query_returns_black() {
-        let mut terminal = TerminalState::new(3, 16, false);
-        let (replies, _) = terminal.process(b"\x1b]11;?\x07");
+    fn osc_background_query_follows_host_surface() {
+        let host = HostSurface::from_bg(0x1e, 0x1e, 0x2e);
+        let mut dark = TerminalState::new(3, 16, false, host);
+        let (replies, _) = dark.process(b"\x1b]11;?\x07");
         let response = String::from_utf8_lossy(&replies);
         assert!(
-            response.contains("\x1b]11;rgb:0000/0000/0000"),
-            "expected black background reply, got: {response:?}"
+            response.contains("\x1b]11;rgb:1e1e/1e1e/2e2e"),
+            "expected host bg reply, got: {response:?}"
         );
+
+        let mut light = TerminalState::new(3, 16, false, light_surface());
+        let (replies, _) = light.process(b"\x1b]11;?\x07");
+        let response = String::from_utf8_lossy(&replies);
         assert!(
-            !response.to_ascii_lowercase().contains("c0c0"),
-            "must not answer with the old gray stub: {response:?}"
+            response.contains("\x1b]11;rgb:f8f8/f8f8/f8f8"),
+            "expected light theme bg reply, got: {response:?}"
         );
     }
 
     #[test]
     fn scroll_display_lines_moves_into_history() {
-        let mut terminal = TerminalState::new(5, 20, false);
-        // Push enough lines to build primary-buffer scrollback.
+        let mut terminal = TerminalState::new(5, 20, false, dark_surface());
         let mut bump = Vec::new();
         for i in 0..40 {
             bump.extend_from_slice(format!("line-{i}\r\n").as_bytes());
@@ -1101,32 +1222,38 @@ mod tests {
         assert_eq!(terminal.term.grid().display_offset(), 3);
         assert!(terminal.scroll_display_lines(-3));
         assert_eq!(terminal.term.grid().display_offset(), 0);
-        // Alt screen has no history — scroll is a no-op.
         let _ = terminal.process(b"\x1b[?1049h");
         assert!(!terminal.scroll_display_lines(5));
     }
 
     #[test]
-    fn convert_named_reads_palette_then_ansi_fallback() {
+    fn convert_named_uses_host_surface_rgb() {
         let empty = alacritty_terminal::term::color::Colors::default();
+        let host = HostSurface::from_bg(0x1e, 0x1e, 0x2e);
         assert_eq!(
-            convert_color(TermColor::Named(NamedColor::Red), &empty),
+            convert_color(TermColor::Named(NamedColor::Red), &empty, host),
             Color::Indexed(1)
         );
         assert_eq!(
-            convert_color(TermColor::Named(NamedColor::DimWhite), &empty),
-            Color::Indexed(7)
+            convert_color(TermColor::Named(NamedColor::Background), &empty, host),
+            Color::Rgb(0x1e, 0x1e, 0x2e)
         );
         assert_eq!(
-            convert_color(TermColor::Named(NamedColor::Foreground), &empty),
-            Color::Reset
+            convert_color(TermColor::Named(NamedColor::Foreground), &empty, host),
+            Color::Rgb(host.fg.0, host.fg.1, host.fg.2)
         );
-
-        // Indexed without a live slot still resolves via xterm defaults → RGB
-        // so paint does not depend on the outer terminal's ANSI table alone.
+        let light = light_surface();
         assert_eq!(
-            convert_color(TermColor::Indexed(1), &empty),
-            Color::Rgb(0xcd, 0x00, 0x00)
+            convert_color(TermColor::Named(NamedColor::Background), &empty, light),
+            Color::Rgb(light.bg.0, light.bg.1, light.bg.2)
+        );
+        assert_eq!(
+            convert_color(TermColor::Indexed(1), &empty, dark_surface()),
+            Color::Indexed(1)
+        );
+        assert_eq!(
+            convert_color(TermColor::Indexed(1), &empty, light_surface()),
+            Color::Indexed(1)
         );
     }
 }

@@ -75,6 +75,8 @@ pub struct SessionSupervisor {
     /// Whether the outer terminal supports kitty keyboard protocol.
     /// Passed to PtySession to set the VT's kitty_keyboard config. (§4.2.3a.2)
     kitty_keyboard: bool,
+    /// Host FG/BG mirrored into new/live PTY palettes (OSC 10/11 + paint).
+    host_surface: crate::appearance::HostSurface,
     /// Last-seen disk session ids per workspace — used to detect newly created
     /// fork/branch children without mistaking historical siblings for rebinds.
     known_disk_ids: HashMap<String, HashSet<String>>,
@@ -93,8 +95,19 @@ impl SessionSupervisor {
             next_new: 1,
             kill_threads: Vec::new(),
             kitty_keyboard,
+            host_surface: crate::appearance::HostSurface::fallback(
+                crate::appearance::Appearance::Dark,
+            ),
             known_disk_ids: HashMap::new(),
             pending_rebinds: Vec::new(),
+        }
+    }
+
+    /// Sync host surface into all live PTYs (palette + Mode 2031 notify for omp).
+    pub fn set_host_surface(&mut self, surface: crate::appearance::HostSurface) {
+        self.host_surface = surface;
+        for entry in self.live.values() {
+            entry.pty.set_host_surface(surface);
         }
     }
 
@@ -354,7 +367,16 @@ impl SessionSupervisor {
         }
         let args = self.provider.spawn_resume_args(cwd, session_id);
         let pins = self.config.effective_pi_pins();
-        let pty = PtySession::spawn(&self.provider.omp_bin, &args, cwd, rows, cols, &pins, self.kitty_keyboard)
+        let pty = PtySession::spawn(
+            &self.provider.omp_bin,
+            &args,
+            cwd,
+            rows,
+            cols,
+            &pins,
+            self.kitty_keyboard,
+            self.host_surface,
+        )
             .with_context(|| format!("spawn omp --resume {session_id}"))?;
         self.live.insert(
             session_id.to_string(),
@@ -391,7 +413,16 @@ impl SessionSupervisor {
         let lock = SessionLock::try_acquire(&id)?;
         let args = self.provider.spawn_new_args(cwd);
         let pins = self.config.effective_pi_pins();
-        let pty = PtySession::spawn(&self.provider.omp_bin, &args, cwd, rows, cols, &pins, self.kitty_keyboard)
+        let pty = PtySession::spawn(
+            &self.provider.omp_bin,
+            &args,
+            cwd,
+            rows,
+            cols,
+            &pins,
+            self.kitty_keyboard,
+            self.host_surface,
+        )
             .context("spawn omp")?;
         self.live.insert(
             id.clone(),

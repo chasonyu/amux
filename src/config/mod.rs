@@ -7,7 +7,19 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::appearance::{Appearance, HostSurface};
 use crate::escape::DEFAULT_ESCAPE_BYTE;
+
+/// How amux picks dark/light chrome + PTY palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AppearanceMode {
+    /// OSC 11 → COLORFGBG → Dark.
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AmuxConfig {
@@ -22,6 +34,9 @@ pub struct AmuxConfig {
     pub session_dir: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
+    /// Force theme (`dark` / `light`) or follow host (`auto`, default).
+    #[serde(default)]
+    pub appearance: AppearanceMode,
 }
 
 fn default_escape_key() -> String {
@@ -36,11 +51,43 @@ impl Default for AmuxConfig {
             omp_bin: None,
             session_dir: None,
             profile: None,
+            appearance: AppearanceMode::Auto,
         }
     }
 }
 
 impl AmuxConfig {
+    /// Resolve effective appearance: forced dark/light, else probed value.
+    pub fn resolve_appearance(&self, probed: Appearance) -> Appearance {
+        match self.appearance {
+            AppearanceMode::Auto => probed,
+            AppearanceMode::Dark => Appearance::Dark,
+            AppearanceMode::Light => Appearance::Light,
+        }
+    }
+
+    /// Resolve host FG/BG for PTY. Auto keeps probed RGB; forced theme uses
+    /// probed RGB only when the classification still matches, else fallback.
+    pub fn resolve_host_surface(&self, probed: HostSurface) -> HostSurface {
+        match self.appearance {
+            AppearanceMode::Auto => probed,
+            AppearanceMode::Dark => {
+                if probed.appearance == Appearance::Dark {
+                    probed
+                } else {
+                    HostSurface::fallback(Appearance::Dark)
+                }
+            }
+            AppearanceMode::Light => {
+                if probed.appearance == Appearance::Light {
+                    probed
+                } else {
+                    HostSurface::fallback(Appearance::Light)
+                }
+            }
+        }
+    }
+
     pub fn amux_dir() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))

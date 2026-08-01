@@ -32,8 +32,11 @@ use ratatui::{Frame, Terminal};
 use signal_hook::consts::signal::{SIGHUP, SIGWINCH};
 use signal_hook::flag as signal_flag;
 
-use crate::appearance::{probe_appearance, Appearance};
-use crate::config::AmuxConfig;
+use crate::appearance::{
+    host_surface_from_osc11_seq, is_da1_reply, parse_mode2031_dsr, probe_host_surface, Appearance,
+    HostSurface,
+};
+use crate::config::{AmuxConfig, AppearanceMode};
 use crate::theme::Theme;
 use crate::escape::{EscapeAction, EscapeToggle};
 use crate::mouse::{
@@ -141,9 +144,10 @@ pub struct App {
     last_mouse_x: u16,
     last_mouse_y: u16,
     theme: Theme,
-    /// Host terminal appearance from OSC 11 (startup probe; Mode 2031 later).
-    #[allow(dead_code)]
+    /// Host terminal appearance classification (dark/light).
     appearance: Appearance,
+    /// Probed (or fallback) FG/BG shared with live PTY OSC replies + default paint.
+    host_surface: HostSurface,
     /// Watches current workspace omp session dir for title / list changes.
     session_watch: SessionDirWatcher,
     dirty_session_paths: HashSet<PathBuf>,
@@ -185,6 +189,7 @@ impl App {
             // Overwritten in `run` after OSC 11 probe (before raw/alt screen).
             theme: Theme::default(),
             appearance: Appearance::Dark,
+            host_surface: HostSurface::fallback(Appearance::Dark),
             total_dropped_keys: 0,
             total_write_drops: 0,
             drop_notice: None,
@@ -219,24 +224,30 @@ impl App {
     pub fn run(&mut self) -> Result<()> {
         let mut stdout = io::stdout();
 
-        // OSC 11 appearance probe timing:
-        // - Prefer **before** `enable_raw_mode` so stdin is still cooked and
-        //   the ~200ms poll reply isn't mixed with raw-mode framing.
-        // - Prefer **before** `EnterAlternateScreen` (primary screen) when
-        //   possible; if already in alt screen, querying once still works.
-        // - Fail / timeout → Dark (handled inside `probe_appearance`).
+        // Raw mode BEFORE OSC 11 probe (same as omp). Cooked/ICANON never
+        // delivers a newline-less OSC reply to read(), so the old order
+        // always timed out → Dark and left `^[]11;rgb:…` in the TTY for zsh.
+        enable_raw_mode().context("enable_raw_mode")?;
+
         {
             let mut stdin = io::stdin();
-            let appearance = probe_appearance(&mut stdout, &mut stdin);
-            self.appearance = appearance;
-            self.theme = Theme::for_appearance(appearance);
+            let probed = probe_host_surface(&mut stdout, &mut stdin);
+            let surface = self.config.resolve_host_surface(probed);
+            self.apply_host_surface(surface);
             tracing::info!(
                 target: "amux",
-                "startup: appearance={appearance:?}"
+                "startup: appearance={:?} bg={:02x}{:02x}{:02x} fg={:02x}{:02x}{:02x} (probed={:?}, mode={:?})",
+                surface.appearance,
+                surface.bg.0,
+                surface.bg.1,
+                surface.bg.2,
+                surface.fg.0,
+                surface.fg.1,
+                surface.fg.2,
+                probed.appearance,
+                self.config.appearance
             );
         }
-
-        enable_raw_mode().context("enable_raw_mode")?;
 
         // Setup + event loop. Any `?` inside run_inner returns Err here;
         // the teardown below ALWAYS runs — even on setup failure. (§4.2.10)
@@ -246,6 +257,7 @@ impl App {
         // Teardown — restores terminal on every exit path. (§4.2.10 / E14)
         self.sessions.shutdown_all_blocking();
         let _ = set_nonblocking(stdin_fd, false);
+        let _ = write!(io::stdout(), "\x1b[?2031l"); // Mode 2031 off
         let _ = baseline_host_modes(&mut io::stdout());
         if self.kb.kitty {
             let _ = write!(io::stdout(), "\x1b[<u");
@@ -259,6 +271,56 @@ impl App {
         );
         let _ = disable_raw_mode();
         result
+    }
+
+    /// Update chrome theme + live PTY palettes (and notify omp via Mode 2031 DSR).
+    fn apply_host_surface(&mut self, surface: HostSurface) {
+        self.host_surface = surface;
+        self.appearance = surface.appearance;
+        self.theme = Theme::for_appearance(surface.appearance);
+        self.sessions.set_host_surface(surface);
+    }
+
+    /// Host appearance / probe sequences — never forward to the agent.
+    /// Handles Mode 2031 DSR, late OSC 11 replies, and orphaned DA1 sentinels.
+    fn consume_host_appearance_seq(&mut self, bytes: &[u8]) -> bool {
+        if is_da1_reply(bytes) {
+            return true;
+        }
+        if self.config.appearance != AppearanceMode::Auto {
+            // Still swallow host theme noise when appearance is forced.
+            return parse_mode2031_dsr(bytes).is_some()
+                || host_surface_from_osc11_seq(bytes).is_some();
+        }
+        if let Some(surface) = host_surface_from_osc11_seq(bytes) {
+            if surface != self.host_surface {
+                tracing::info!(
+                    target: "amux",
+                    "host surface from OSC 11: {:?} bg={:02x}{:02x}{:02x}",
+                    surface.appearance,
+                    surface.bg.0,
+                    surface.bg.1,
+                    surface.bg.2
+                );
+                self.apply_host_surface(surface);
+            }
+            return true;
+        }
+        if let Some(reported) = parse_mode2031_dsr(bytes) {
+            // Classification-only notify: apply fallback, then re-query RGB.
+            if reported != self.appearance {
+                tracing::info!(
+                    target: "amux",
+                    "appearance change via Mode 2031: {:?} → {:?}",
+                    self.appearance,
+                    reported
+                );
+                self.apply_host_surface(HostSurface::fallback(reported));
+            }
+            let _ = write!(io::stdout(), "\x1b]11;?\x07");
+            return true;
+        }
+        false
     }
 
     fn run_inner(
@@ -276,6 +338,8 @@ impl App {
         // Also pin click+SGR via raw CSI (keeps Nav baseline if crossterm
         // EnableMouseCapture set differs across versions).
         apply_nav_host_modes(stdout)?;
+        // Mode 2031: host pushes `\x1b[?997;{1=dark,2=light}n` on theme change.
+        let _ = write!(stdout, "\x1b[?2031h");
         // Soft keyboard probe enable if host supports
         if self.kb.kitty {
             let _ = write!(stdout, "\x1b[>3u"); // disambiguate + report-alternate-keys
@@ -651,6 +715,11 @@ impl App {
                 continue;
             }
 
+            // Host theme notify — never forward to omp.
+            if self.consume_host_appearance_seq(&seq.bytes) {
+                continue;
+            }
+
             if self.escape.is_escape_seq(&seq.bytes) {
                 let action = self.escape.on_escape(Instant::now());
                 match action {
@@ -854,6 +923,9 @@ impl App {
                 || seq.bytes == crate::raw_input::BRACKET_PASTE_END
             {
                 self.escape.clear();
+                continue;
+            }
+            if self.consume_host_appearance_seq(&seq.bytes) {
                 continue;
             }
             if is_sgr_mouse(&seq.bytes) {
@@ -2065,13 +2137,8 @@ impl App {
     }
 }
 
-/// dux-style Help: dim scrim + dark panel + cyan banners + key rows + footer.
+/// dux-style Help: panel + cyan banners + key rows + footer (no full-screen scrim).
 fn draw_help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
-    f.render_widget(
-        Block::default().style(Style::default().bg(theme.overlay_dim_bg)),
-        area,
-    );
-
     let w = (area.width * 72 / 100).clamp(40, 88);
     let h = (area.height * 70 / 100).clamp(16, area.height.saturating_sub(2).max(16));
     let rect = Rect {
@@ -2484,13 +2551,7 @@ fn draw_confirm_dialog(
     body: &[&str],
     yes_focused: bool,
 ) {
-    // Full-screen scrim so the dialog reads as a layer (RGB truecolor is
-    // often ignored under TERM=xterm / WebSSH — panel uses Indexed colors).
-    f.render_widget(
-        Block::default().style(Style::default().bg(theme.overlay_dim_bg)),
-        area,
-    );
-
+    // Panel only — no full-screen scrim (host bg stays visible around the dialog).
     let pad = 4u16;
     let mut content_w = unicode_width::UnicodeWidthStr::width(title.trim()) as u16;
     for line in body {
