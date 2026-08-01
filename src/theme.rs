@@ -22,7 +22,12 @@ const TITLE_MUTED: Color = Color::Rgb(140, 140, 140);
 const LIGHT_TEXT: Color = Color::Rgb(30, 30, 30);
 const LIGHT_BORDER: Color = Color::Rgb(176, 176, 176); // lightGray
 const LIGHT_TITLE_MUTED: Color = Color::Rgb(108, 108, 108); // mediumGray
-const LIGHT_TEAL: Color = Color::Rgb(90, 128, 128); // omp teal
+/// omp light.json teal — keep for soft transcript / md accents.
+const LIGHT_TEAL: Color = Color::Rgb(90, 128, 128);
+/// Stronger chrome accent for selection / focused borders on white host bg.
+const LIGHT_ACCENT: Color = Color::Rgb(0, 140, 150);
+const LIGHT_SELECTION_BG: Color = Color::Rgb(0, 165, 175);
+const LIGHT_SELECTION_FG: Color = Color::Rgb(255, 255, 255);
 const LIGHT_OVERLAY_BG: Color = Color::Indexed(254); // near-white panel
 const LIGHT_OVERLAY_SCRIM: Color = Color::Indexed(252); // light veil
 /// omp transcript symbols (theme.ts symbol preset).
@@ -225,54 +230,57 @@ impl Theme {
         }
     }
 
-    /// Light chrome ≈ omp `light.json` accents; large fills Reset → host page.
+    /// Light chrome: vivid selection/borders (readable on white host);
+    /// transcript soft fills stay close to omp `light.json`.
     pub fn light() -> Self {
         Self {
             // Match dark: leak host light background instead of a hard #f8f8f8 box.
             app_bg: Color::Reset,
             text_fg: LIGHT_TEXT,
-            border_focused: LIGHT_TEAL,
+            border_focused: LIGHT_ACCENT,
             border_normal: LIGHT_BORDER,
-            title_focused: LIGHT_TEAL,
+            title_focused: LIGHT_ACCENT,
             title_normal: LIGHT_TITLE_MUTED,
-            selection_fg: LIGHT_TEXT,
-            selection_bg: Color::Rgb(208, 208, 224), // selectedBg
+            selection_fg: LIGHT_SELECTION_FG,
+            selection_bg: LIGHT_SELECTION_BG,
             session_active: Color::Rgb(40, 40, 40),
             session_detached: Color::Rgb(154, 115, 38), // yellow
             session_exited: Color::Rgb(118, 118, 118), // dimGray
-            hint_key_fg: LIGHT_TEAL,
-            hint_bracket_fg: LIGHT_TEAL,
+            hint_key_fg: LIGHT_ACCENT,
+            hint_bracket_fg: LIGHT_ACCENT,
             hint_key_bg: Color::Indexed(254),
             hint_desc_fg: LIGHT_TITLE_MUTED,
-            hint_dim_key_fg: LIGHT_TEAL,
-            hint_dim_bracket_fg: LIGHT_TEAL,
+            hint_dim_key_fg: LIGHT_ACCENT,
+            hint_dim_bracket_fg: LIGHT_ACCENT,
             hint_dim_desc_fg: LIGHT_TITLE_MUTED,
             hint_bar_bg: Color::Reset,
-            overlay_border: LIGHT_TEAL,
+            overlay_border: LIGHT_ACCENT,
             overlay_bg: LIGHT_OVERLAY_BG,
             overlay_dim_bg: LIGHT_OVERLAY_SCRIM,
             overlay_dim_fg: Color::Rgb(118, 118, 118),
             help_panel_bg: Color::Indexed(255), // white panel
-            help_banner_fg: Color::Rgb(248, 248, 248),
-            help_banner_bg: LIGHT_TEAL,
+            help_banner_fg: Color::Rgb(255, 255, 255),
+            help_banner_bg: LIGHT_ACCENT,
             help_body_fg: Color::Rgb(60, 60, 60),
-            help_section_fg: LIGHT_TEAL,
+            help_section_fg: LIGHT_ACCENT,
             input_cursor_fg: Color::Rgb(255, 255, 255),
             input_cursor_bg: LIGHT_TEXT,
             input_label_fg: LIGHT_TEXT,
             status_info_fg: LIGHT_TITLE_MUTED,
             status_info_bg: Color::Reset,
             project_icon: Color::Rgb(84, 125, 167),   // blue
-            status_mode_agent_bg: Color::Rgb(0, 95, 95),
-            status_mode_shell_bg: Color::Rgb(175, 95, 0),
-            status_mode_modal_bg: Color::Rgb(135, 95, 135),
+            // Powerline mode pills — saturated so NAV/AGENT read at a glance.
+            status_mode_agent_bg: Color::Rgb(0, 145, 155),
+            status_mode_shell_bg: Color::Rgb(200, 110, 0),
+            status_mode_modal_bg: Color::Rgb(150, 90, 170),
             status_mode_fg: Color::Rgb(255, 255, 255),
             status_seg_a_bg: Color::Rgb(220, 220, 220),
-            status_seg_b_bg: Color::Rgb(0, 95, 135), // statusLinePath
-            status_seg_fg: LIGHT_TEXT,
-            status_msg_bg: Color::Rgb(232, 232, 232),
-            status_msg_fg: Color::Rgb(60, 60, 60),
-            status_ws_bg: Color::Rgb(0, 95, 135),
+            // Session / path chips: deep teal-blue + white (was dark-on-dark).
+            status_seg_b_bg: Color::Rgb(0, 110, 145),
+            status_seg_fg: Color::Rgb(255, 255, 255),
+            status_msg_bg: Color::Rgb(235, 238, 242),
+            status_msg_fg: Color::Rgb(50, 55, 65),
+            status_ws_bg: Color::Rgb(0, 110, 145),
             status_ws_fg: Color::Rgb(255, 255, 255),
             // omp light userMsgBg / thinking / toolOutput
             transcript_user_bg: Color::Rgb(232, 232, 232), // #e8e8e8
@@ -281,15 +289,15 @@ impl Theme {
             transcript_tool_fg: Color::Rgb(108, 108, 108), // mediumGray toolOutput
             transcript_thinking_fg: Color::Rgb(108, 108, 108), // thinkingText
             transcript_meta_fg: Color::Rgb(118, 118, 118), // dimGray
-            accent: LIGHT_TEAL,
+            accent: LIGHT_ACCENT,
             border_muted: LIGHT_BORDER,
-            border_accent: Color::Rgb(0x00, 0x5f, 0x87),
+            border_accent: LIGHT_ACCENT,
             success: Color::Rgb(0x50, 0x8c, 0x50),
             error: Color::Rgb(0xc8, 0x3c, 0x3c),
             warning: Color::Rgb(0xb4, 0x8c, 0x00),
             muted: LIGHT_TITLE_MUTED,
             dim: Color::Rgb(0x8c, 0x8c, 0x8c),
-            md_heading: LIGHT_TEAL,
+            md_heading: LIGHT_ACCENT,
             md_link: Color::Rgb(0x00, 0x5f, 0x87),
             md_code: Color::Rgb(0x78, 0x3c, 0x8c),
             md_code_block: LIGHT_TEXT,
@@ -394,5 +402,17 @@ mod tests {
             Theme::dark().transcript_user_bg,
             Theme::light().transcript_user_bg
         );
+    }
+
+    #[test]
+    fn light_selection_and_status_are_high_contrast() {
+        let t = Theme::light();
+        assert_eq!(t.selection_bg, LIGHT_SELECTION_BG);
+        assert_eq!(t.selection_fg, LIGHT_SELECTION_FG);
+        assert_eq!(t.border_focused, LIGHT_ACCENT);
+        // Colored status chips use light fg (not LIGHT_TEXT on dark teal).
+        assert_eq!(t.status_seg_fg, Color::Rgb(255, 255, 255));
+        assert_eq!(t.status_mode_fg, Color::Rgb(255, 255, 255));
+        assert_ne!(t.status_mode_agent_bg, t.status_mode_shell_bg);
     }
 }

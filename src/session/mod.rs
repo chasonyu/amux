@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use crate::config::AmuxConfig;
 use crate::lock::{check_occupiable, SessionLock};
 use crate::provider::omp::{parent_refers_to, OmpDiskSession, OmpProvider, TitleKind};
+use crate::provider::turn_status::agent_turn_busy;
 use crate::pty::PtySession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,10 @@ pub struct SessionSummary {
     pub size: u64,
     pub live: bool,
     pub status: SessionStatus,
+    /// Live PTY + JSONL tail says agent still owes work (pending/interrupted).
+    pub agent_busy: bool,
+    /// Turn finished while this row was not being viewed — clear on select/attach.
+    pub unread: bool,
 }
 
 struct LiveEntry {
@@ -199,6 +204,8 @@ impl SessionSupervisor {
                         size: 0,
                         live: true,
                         status: entry.status,
+                        agent_busy: false,
+                        unread: false,
                     },
                 );
             }
@@ -213,6 +220,9 @@ impl SessionSupervisor {
         } else {
             SessionStatus::Disk
         };
+        let path = d.path.clone();
+        let pty_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
+        let agent_busy = agent_turn_busy(live, pty_active, Some(path.as_path()));
         SessionSummary {
             id: d.id,
             workspace_id: workspace_id.to_string(),
@@ -220,12 +230,14 @@ impl SessionSupervisor {
             title: d.title,
             title_kind: d.title_kind,
             is_fork: d.parent_session.is_some(),
-            path: Some(d.path),
+            path: Some(path),
             cwd: cwd.to_path_buf(),
             mtime: d.mtime,
             size: d.size,
             live,
             status,
+            agent_busy,
+            unread: false,
         }
     }
 

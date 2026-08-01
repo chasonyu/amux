@@ -105,7 +105,7 @@ impl DirBrowser {
 
         // Normal browse mode (dux CloseOverlay / OpenEntry / AddCurrentDir / …)
         match seq {
-            b"\x1b" => {
+            seq if super::is_escape_key(seq) => {
                 if !self.filter.is_empty() {
                     self.filter.clear();
                     self.selected = 0;
@@ -154,7 +154,7 @@ impl DirBrowser {
 
     fn handle_searching(mut self, seq: &[u8]) -> BrowserResult {
         match seq {
-            b"\x1b" => {
+            seq if super::is_escape_key(seq) => {
                 // Exit search mode; keep filter text (dux CloseOverlay while searching).
                 self.searching = false;
                 BrowserResult::Continue(self)
@@ -187,8 +187,15 @@ impl DirBrowser {
 
     fn handle_path_editor(mut self, seq: &[u8]) -> BrowserResult {
         match seq {
-            b"\x1b" | b"\x07" => {
-                // Esc or Ctrl+G — back to browse
+            b"\x07" => {
+                // Ctrl+G — back to browse
+                self.editing_path = false;
+                self.path_input.clear();
+                self.tab_completions.clear();
+                self.tab_index = 0;
+                BrowserResult::Continue(self)
+            }
+            seq if super::is_escape_key(seq) => {
                 self.editing_path = false;
                 self.path_input.clear();
                 self.tab_completions.clear();

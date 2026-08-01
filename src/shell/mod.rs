@@ -4,7 +4,7 @@ pub mod dir_browser;
 pub mod mode_mirror;
 mod text_input;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -44,9 +44,9 @@ use crate::mouse::{
     sgr_wheel_delta, translate_sgr_mouse_clipped,
 };
 use crate::provider::{
-    delete_session_with_artifacts, load, refresh_disk_session, render_blocks, sanitize_session_title,
-    write_session_title, RenderedLine, SessionDirEvent, SessionDirWatcher, SpanStyle, TitleKind,
-    TranscriptBlock, TranscriptRole,
+    agent_turn_busy, delete_session_with_artifacts, load, refresh_disk_session, render_blocks,
+    sanitize_session_title, write_session_title, RenderedLine, SessionDirEvent, SessionDirWatcher,
+    SpanStyle, TitleKind, TranscriptBlock, TranscriptRole,
 };
 use crate::pty::MirroredModes;
 use crate::raw_input::{is_sgr_mouse, RawInputParser};
@@ -164,6 +164,8 @@ pub struct App {
     title_debounce_until: Option<Instant>,
     title_need_rescan: bool,
     last_title_poll: Instant,
+    /// Epoch for braille busy-spinner animation in the session list.
+    anim_t0: Instant,
     /// Cached JSONL transcript for the Agent preview pane.
     transcript_cache: Option<TranscriptCache>,
 }
@@ -227,6 +229,7 @@ impl App {
             title_debounce_until: None,
             title_need_rescan: false,
             last_title_poll: Instant::now(),
+            anim_t0: Instant::now(),
             transcript_cache: None,
         })
     }
@@ -449,6 +452,22 @@ impl App {
             }
 
             let just_exited = self.sessions.poll_exits();
+            if !just_exited.is_empty() {
+                // Drop busy wave immediately — do not wait for a full rescan.
+                let mut finished = Vec::new();
+                for id in &just_exited {
+                    if let Some(s) = self.session_list.iter_mut().find(|s| s.id == *id) {
+                        if s.agent_busy {
+                            finished.push(id.clone());
+                        }
+                        s.status = SessionStatus::Exited;
+                        s.agent_busy = false;
+                    }
+                }
+                for id in finished {
+                    self.mark_unread_if_not_watching(&id);
+                }
+            }
             if self.focus == Focus::Agent {
                 if let Some(id) = self.focused_session_id.clone() {
                     if just_exited.iter().any(|e| e == &id) {
@@ -620,13 +639,24 @@ impl App {
                 continue;
             };
             self.sessions.apply_disk_title(&disk);
+            let mut finished: Option<String> = None;
             if let Some(s) = self.session_list.iter_mut().find(|s| s.id == disk.id) {
                 s.title = disk.title.clone();
                 s.title_kind = disk.title_kind;
                 s.is_fork = disk.parent_session.is_some();
                 s.mtime = disk.mtime;
                 s.size = disk.size;
-                s.path = Some(disk.path);
+                s.path = Some(disk.path.clone());
+                let pty_active =
+                    matches!(s.status, SessionStatus::Starting | SessionStatus::Running);
+                let busy = agent_turn_busy(s.live, pty_active, Some(disk.path.as_path()));
+                if s.agent_busy && !busy {
+                    finished = Some(s.id.clone());
+                }
+                s.agent_busy = busy;
+            }
+            if let Some(id) = finished {
+                self.mark_unread_if_not_watching(&id);
             }
         }
     }
@@ -664,19 +694,32 @@ impl App {
                 break;
             }
             self.sessions.apply_disk_title(&disk);
+            let mut finished: Option<String> = None;
             if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
                 let is_fork = disk.parent_session.is_some();
+                let pty_active =
+                    matches!(s.status, SessionStatus::Starting | SessionStatus::Running);
+                let busy = agent_turn_busy(s.live, pty_active, Some(disk.path.as_path()));
                 if s.title != disk.title
                     || s.title_kind != disk.title_kind
                     || s.is_fork != is_fork
+                    || s.agent_busy != busy
                 {
                     changed = true;
+                }
+                if s.agent_busy && !busy {
+                    finished = Some(s.id.clone());
                 }
                 s.title = disk.title;
                 s.title_kind = disk.title_kind;
                 s.is_fork = is_fork;
                 s.mtime = disk.mtime;
                 s.size = disk.size;
+                s.agent_busy = busy;
+            }
+            if let Some(fid) = finished {
+                self.mark_unread_if_not_watching(&fid);
+                changed = true;
             }
         }
 
@@ -899,6 +942,9 @@ impl App {
             }
         }
         self.focus = Focus::Agent;
+        if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
+            s.unread = false;
+        }
         if let Some(pty) = self.sessions.get(&id) {
             let modes = pty.mirrored_modes();
             apply_host_modes(&mut io::stdout(), &modes)?;
@@ -936,6 +982,11 @@ impl App {
                 continue;
             }
             if self.consume_host_appearance_seq(&seq.bytes) {
+                continue;
+            }
+            // Focus reporting (DECSET 1004) — cmux/SSH often injects these;
+            // never treat as modal dismiss / confirm cancel.
+            if seq.bytes == b"\x1b[I" || seq.bytes == b"\x1b[O" {
                 continue;
             }
             if is_sgr_mouse(&seq.bytes) {
@@ -1012,6 +1063,7 @@ impl App {
         if point_in_rect(x, y, sess.x, sess.y, sess.width, sess.height) {
             if let Some(i) = list_row_index(y, sess.y, sess.height, self.session_list.len()) {
                 self.selected_session = i;
+                self.clear_selected_unread();
             }
             // else: past last session → chrome
             return Ok(());
@@ -1067,7 +1119,14 @@ impl App {
         };
         match modal {
             Modal::Help => {
-                self.focus = Focus::Nav;
+                // Esc closes; ignore focus/CSI-u noise (cmux) that used to
+                // dismiss Help on the same tick as `?`.
+                if is_escape_key(seq) || seq == b"q" || seq == b"Q" {
+                    self.focus = Focus::Nav;
+                } else {
+                    self.modal = Some(Modal::Help);
+                    self.focus = Focus::Modal;
+                }
             }
             Modal::ConfirmQuit { mut yes_focused } => {
                 match confirm_key(seq, &mut yes_focused) {
@@ -1153,7 +1212,7 @@ impl App {
                 mut input,
                 error: _,
             } => match seq {
-                b"\x1b" => {
+                seq if is_escape_key(seq) => {
                     self.focus = Focus::Nav;
                 }
                 b"\r" | b"\n" => {
@@ -1416,6 +1475,25 @@ impl App {
         let len = self.session_list.len() as i32;
         let next = (self.selected_session as i32 + delta).rem_euclid(len) as usize;
         self.selected_session = next;
+        self.clear_selected_unread();
+    }
+
+    fn clear_selected_unread(&mut self) {
+        if let Some(s) = self.session_list.get_mut(self.selected_session) {
+            s.unread = false;
+        }
+    }
+
+    /// Mark unread when a turn finishes off-screen (busy → idle).
+    fn mark_unread_if_not_watching(&mut self, id: &str) {
+        let watching = self.focus == Focus::Agent
+            && self.focused_session_id.as_deref() == Some(id);
+        if watching {
+            return;
+        }
+        if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
+            s.unread = true;
+        }
     }
 
     fn move_workspace(&mut self, delta: i32) {
@@ -1434,6 +1512,11 @@ impl App {
             .session_list
             .get(self.selected_session)
             .map(|s| s.id.clone());
+        let prev: HashMap<String, (bool, bool)> = self
+            .session_list
+            .iter()
+            .map(|s| (s.id.clone(), (s.agent_busy, s.unread)))
+            .collect();
         self.session_list.clear();
         if let Some(ws) = self.workspaces.list().get(self.selected_ws) {
             match self.sessions.list_for_workspace(&ws.id, Path::new(&ws.path)) {
@@ -1443,12 +1526,31 @@ impl App {
         }
         // omp /fork|/branch rebinds the same PTY to a new jsonl — follow it.
         let mut select_id = selected_id;
-        for (old, new) in self.sessions.drain_rebinds() {
+        let rebinds = self.sessions.drain_rebinds();
+        for (old, new) in &rebinds {
             if self.focused_session_id.as_deref() == Some(old.as_str()) {
                 self.focused_session_id = Some(new.clone());
             }
             if select_id.as_deref() == Some(old.as_str()) {
-                select_id = Some(new);
+                select_id = Some(new.clone());
+            }
+        }
+        // Restore unread + detect busy→idle across the rescan / rebind.
+        for s in &mut self.session_list {
+            let key = rebinds
+                .iter()
+                .find(|(_, new)| new == &s.id)
+                .map(|(old, _)| old.as_str())
+                .unwrap_or(s.id.as_str());
+            if let Some((was_busy, was_unread)) = prev.get(key) {
+                s.unread = *was_unread;
+                if *was_busy && !s.agent_busy {
+                    let watching = self.focus == Focus::Agent
+                        && self.focused_session_id.as_deref() == Some(s.id.as_str());
+                    if !watching {
+                        s.unread = true;
+                    }
+                }
             }
         }
         // Prefer focused session for selection (covers fork rebind + attach).
@@ -1475,6 +1577,7 @@ impl App {
             self.status = "No session — press n to create".into();
             return Ok(());
         };
+        self.clear_selected_unread();
         // Live non-Exited + already focused → enter_agent only (B3).
         let already_live = summary.live
             && summary.status != SessionStatus::Exited
@@ -1774,11 +1877,12 @@ impl App {
                     Style::default().fg(t.session_detached)
                 };
                 let rt = relative_time(s.mtime);
-                // Right side: [fork] [time] — time furthest right (omp resume UI).
+                // Right side: [fork] [time] [unread] — time then badge at tail.
+                let unread_mark = if s.unread { " ●" } else { "" };
                 let right = if s.is_fork {
-                    format!(" fork  {rt}")
+                    format!(" fork  {rt}{unread_mark}")
                 } else {
-                    format!(" {rt}")
+                    format!(" {rt}{unread_mark}")
                 };
                 let prefix = format!("{dot} ");
                 let prefix_w = unicode_width::UnicodeWidthStr::width(prefix.as_str());
@@ -1787,10 +1891,24 @@ impl App {
                 let title = truncate_to_width(&s.title, title_budget);
                 let title_w = unicode_width::UnicodeWidthStr::width(title.as_str());
                 let pad = title_budget.saturating_sub(title_w);
-                let mut spans = vec![
-                    Span::styled(prefix, Style::default().fg(dot_fg)),
-                    Span::styled(title, style),
-                ];
+                let mut spans = vec![Span::styled(prefix, Style::default().fg(dot_fg))];
+                // Busy: selection-color band sweeps across the title.
+                if s.agent_busy {
+                    spans.extend(busy_title_wave_spans(
+                        &title,
+                        self.anim_t0.elapsed().as_millis(),
+                        t.selection_fg,
+                        t.selection_bg,
+                        selected,
+                        if selected {
+                            t.selection_fg
+                        } else {
+                            t.text_fg
+                        },
+                    ));
+                } else {
+                    spans.push(Span::styled(title, style));
+                }
                 if pad > 0 {
                     spans.push(Span::styled(
                         " ".repeat(pad),
@@ -1803,9 +1921,20 @@ impl App {
                 }
                 if s.is_fork {
                     spans.push(Span::styled(" fork ", fork_style));
-                    spans.push(Span::styled(format!(" {rt}"), meta_style));
-                } else {
-                    spans.push(Span::styled(format!(" {rt}"), meta_style));
+                }
+                spans.push(Span::styled(format!(" {rt}"), meta_style));
+                if s.unread {
+                    let unread_style = if selected {
+                        Style::default()
+                            .fg(t.selection_fg)
+                            .bg(t.selection_bg)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(t.selection_bg)
+                            .add_modifier(Modifier::BOLD)
+                    };
+                    spans.push(Span::styled(" ●", unread_style));
                 }
                 ListItem::new(Line::from(spans))
             })
@@ -2618,12 +2747,42 @@ fn truncate_display(s: &str, max: usize) -> String {
     out
 }
 
+/// Bare Esc or Kitty/CSI-u Escape press (`CSI 27 u` / `CSI 27;mods u`).
+/// Key-release forms (`…:3u`) are ignored so they do not cancel modals.
+pub(super) fn is_escape_key(seq: &[u8]) -> bool {
+    if seq == b"\x1b" {
+        return true;
+    }
+    if seq.len() < 5 || seq[0] != 0x1b || seq[1] != b'[' || seq.last() != Some(&b'u') {
+        return false;
+    }
+    let Ok(inner) = std::str::from_utf8(&seq[2..seq.len() - 1]) else {
+        return false;
+    };
+    let mut parts = inner.split(';');
+    if parts.next() != Some("27") {
+        return false;
+    }
+    // Second field may be "mods" or "mods:event" (event 3 = release).
+    if let Some(rest) = parts.next() {
+        if let Some((_, event)) = rest.split_once(':') {
+            if event.starts_with('3') {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Compact GUI-style confirm: snug box + `[ Yes ]` / `[ No ]` buttons.
 /// Keyboard only — ←/→/Tab move focus, Enter activates, y/n shortcuts.
 fn confirm_key(seq: &[u8], yes_focused: &mut bool) -> ConfirmResult {
+    if is_escape_key(seq) {
+        return ConfirmResult::No;
+    }
     match seq {
         b"y" | b"Y" => ConfirmResult::Yes,
-        b"n" | b"N" | b"\x1b" => ConfirmResult::No,
+        b"n" | b"N" => ConfirmResult::No,
         b"\r" | b"\n" | b" " => {
             if *yes_focused {
                 ConfirmResult::Yes
@@ -2641,7 +2800,9 @@ fn confirm_key(seq: &[u8], yes_focused: &mut bool) -> ConfirmResult {
             *yes_focused = false;
             ConfirmResult::Keep
         }
-        _ => ConfirmResult::No,
+        // Ignore focus/CSI-u/noise from clients like cmux instead of treating
+        // every unknown sequence as cancel (was closing modals instantly).
+        _ => ConfirmResult::Keep,
     }
 }
 
@@ -3050,6 +3211,49 @@ fn rendered_line_to_ratatui(t: &Theme, rl: &RenderedLine, width: u16) -> Line<'s
     Line::from(spans)
 }
 
+/// Busy title: a selection-colored band sweeps left→right (same chrome as
+/// the selected session row — not a rainbow).
+fn busy_title_wave_spans(
+    title: &str,
+    elapsed_ms: u128,
+    selection_fg: Color,
+    selection_bg: Color,
+    selected_row: bool,
+    base_fg: Color,
+) -> Vec<Span<'static>> {
+    let chars: Vec<char> = title.chars().collect();
+    let len = chars.len().max(1);
+    // Band center walks past the end so the highlight fully exits before looping.
+    let phase = (elapsed_ms / 90) as usize % (len + 3);
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(i, ch)| {
+            let d = (i as isize - phase as isize).unsigned_abs();
+            // Half-width 2 → ~5 cols (was 1 → ~3); twice as wide.
+            let style = if d <= 2 {
+                if selected_row {
+                    // Row is already selection-colored — invert for a visible sweep.
+                    Style::default()
+                        .fg(selection_bg)
+                        .bg(selection_fg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(selection_fg)
+                        .bg(selection_bg)
+                        .add_modifier(Modifier::BOLD)
+                }
+            } else if selected_row {
+                Style::default().fg(base_fg).bg(selection_bg)
+            } else {
+                Style::default().fg(base_fg)
+            };
+            Span::styled(ch.to_string(), style)
+        })
+        .collect()
+}
+
 /// Compact relative time for session rows (e.g. "5m", "3h", "2d").
 /// Avoids pulling in a humanize crate. (§6.1 sessions show relative time)
 
@@ -3127,5 +3331,30 @@ fn poll_fd(fd: i32, timeout: Duration) -> Result<bool> {
         Ok(n) => Ok(n > 0),
         Err(nix::errno::Errno::EINTR) | Err(nix::errno::Errno::EAGAIN) => Ok(false),
         Err(e) => Err(anyhow::Error::new(e).context("poll stdin")),
+    }
+}
+
+#[cfg(test)]
+mod escape_key_tests {
+    use super::{confirm_key, is_escape_key, ConfirmResult};
+
+    #[test]
+    fn escape_key_bare_and_kitty() {
+        assert!(is_escape_key(b"\x1b"));
+        assert!(is_escape_key(b"\x1b[27u"));
+        assert!(is_escape_key(b"\x1b[27;1u"));
+        assert!(!is_escape_key(b"\x1b[27;1:3u")); // release
+        assert!(!is_escape_key(b"\x1b[I"));
+        assert!(!is_escape_key(b"\x1b[O"));
+        assert!(!is_escape_key(b"q"));
+    }
+
+    #[test]
+    fn confirm_unknown_keeps_escape_cancels() {
+        let mut yes = true;
+        assert_eq!(confirm_key(b"\x1b[I", &mut yes), ConfirmResult::Keep);
+        assert_eq!(confirm_key(b"\x1b[27u", &mut yes), ConfirmResult::No);
+        assert_eq!(confirm_key(b"\x1b", &mut yes), ConfirmResult::No);
+        assert_eq!(confirm_key(b"n", &mut yes), ConfirmResult::No);
     }
 }

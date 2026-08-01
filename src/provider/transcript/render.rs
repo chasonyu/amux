@@ -140,9 +140,20 @@ fn render_one(block: &TranscriptBlock, width: usize, out: &mut Vec<RenderedLine>
             } else {
                 TranscriptRole::User
             };
+            // Match omp UserMessageComponent: Markdown(text, paddingX=1, paddingY=1)
+            // → blank + content(+left pad) + blank, all with user bubble bg.
             let md_width = width.saturating_sub(1).max(1);
-            let md_lines = render_markdown(text, md_width);
-            out.extend(RenderedLine::from_md(role, md_lines, true));
+            let body = RenderedLine::from_md(role, render_markdown(text, md_width), true);
+            if body.is_empty() {
+                return;
+            }
+            if role == TranscriptRole::User {
+                out.push(RenderedLine::plain(role, ""));
+            }
+            out.extend(body);
+            if role == TranscriptRole::User {
+                out.push(RenderedLine::plain(role, ""));
+            }
         }
         TranscriptBlock::Assistant { text } => {
             let md_width = width.saturating_sub(1).max(1);
@@ -553,6 +564,25 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(blanks.len(), 1);
+    }
+
+    #[test]
+    fn user_bubble_has_vertical_padding_like_omp() {
+        let theme = Theme::dark();
+        let blocks = vec![TranscriptBlock::User {
+            text: "hi".into(),
+            synthetic: false,
+        }];
+        let lines = render_blocks(&blocks, 40, &theme);
+        let user: Vec<&RenderedLine> = lines
+            .iter()
+            .filter(|l| l.role == TranscriptRole::User)
+            .collect();
+        // paddingY=1 → blank + content + blank
+        assert_eq!(user.len(), 3, "{:?}", user.iter().map(|l| line_text(l)).collect::<Vec<_>>());
+        assert!(user[0].is_blank());
+        assert!(line_text(user[1]).contains("hi"));
+        assert!(user[2].is_blank());
     }
 
     #[test]
