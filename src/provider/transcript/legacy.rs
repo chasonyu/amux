@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::omp::skip_title_prefix;
+use crate::provider::omp::skip_title_prefix;
 
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_LINES_OUT: usize = 4000;
