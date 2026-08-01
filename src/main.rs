@@ -63,17 +63,13 @@ fn main() -> Result<()> {
         prev_hook(info);
     }));
 
+    // Single-instance: if another amux is running, SIGTERM it (teardown +
+    // child omp) then take the lock. Disk sessions remain resumable.
+    let _instance = amux::lock::acquire_instance_lock_replacing()?;
+    // Keep lock for process lifetime (flock released on exit when File drops).
+    std::mem::forget(_instance);
+
     let mut app = amux::shell::App::new()?;
-    // Soft warn if another instance holds the lock
-    match amux::lock::try_instance_lock() {
-        Ok(_guard) => {
-            // Keep guard alive for process lifetime via leak — simple MVP.
-            std::mem::forget(_guard);
-        }
-        Err(e) => {
-            eprintln!("warning: {e}");
-        }
-    }
 
     if let Err(e) = app.run() {
         // Best-effort restore already done inside run; report error.
