@@ -3,12 +3,14 @@
 //! Line-based preview lives in [`legacy`] until Task 7 migrates the shell.
 
 mod legacy;
+mod markdown;
 mod omp;
 mod util;
 
 use std::path::Path;
 
 pub use legacy::{load_transcript, TranscriptLine, TranscriptRole};
+pub use markdown::{render_markdown, MdKind, MdLine};
 
 pub const COLLAPSED_LINES: usize = 3;
 pub const OUTPUT_COLLAPSED: usize = 3;
