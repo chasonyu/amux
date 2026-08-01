@@ -5,7 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
@@ -202,6 +202,34 @@ pub fn refresh_disk_session(path: &Path) -> Option<OmpDiskSession> {
     let stem = name.trim_end_matches(".jsonl");
     let id = extract_session_id(stem);
     read_disk_session(id, path)
+}
+
+/// Sibling artifacts directory for a session jsonl (`foo.jsonl` → `foo/`).
+/// Mirrors omp `FileSessionStorage.deleteSessionWithArtifacts`.
+pub fn session_artifacts_dir(session_path: &Path) -> Option<PathBuf> {
+    let s = session_path.to_str()?;
+    if !s.ends_with(".jsonl") {
+        return None;
+    }
+    Some(PathBuf::from(&s[..s.len() - ".jsonl".len()]))
+}
+
+/// Delete session jsonl and its sibling artifacts directory (best-effort on dir).
+pub fn delete_session_with_artifacts(session_path: &Path) -> Result<()> {
+    let Some(artifacts) = session_artifacts_dir(session_path) else {
+        bail!("not an omp session jsonl: {}", session_path.display());
+    };
+    if session_path.exists() {
+        fs::remove_file(session_path).with_context(|| {
+            format!("remove session file {}", session_path.display())
+        })?;
+    }
+    if artifacts.exists() {
+        fs::remove_dir_all(&artifacts).with_context(|| {
+            format!("remove artifacts dir {}", artifacts.display())
+        })?;
+    }
+    Ok(())
 }
 
 fn read_disk_session(id: String, jsonl_path: &Path) -> Option<OmpDiskSession> {
@@ -502,5 +530,23 @@ mod tests {
         let (title, kind) = resolve_display_title(&path, "abc");
         assert_eq!(kind, TitleKind::Provisional);
         assert_eq!(title, "keep going please");
+    }
+
+    #[test]
+    fn delete_session_removes_jsonl_and_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("2026-08-01T00-00-00-000Z_abc.jsonl");
+        let artifacts = dir.path().join("2026-08-01T00-00-00-000Z_abc");
+        fs::write(&jsonl, b"{}\n").unwrap();
+        fs::create_dir_all(artifacts.join("nested")).unwrap();
+        fs::write(artifacts.join("nested/x.bin"), b"x").unwrap();
+
+        assert_eq!(
+            session_artifacts_dir(&jsonl).as_deref(),
+            Some(artifacts.as_path())
+        );
+        delete_session_with_artifacts(&jsonl).unwrap();
+        assert!(!jsonl.exists());
+        assert!(!artifacts.exists());
     }
 }

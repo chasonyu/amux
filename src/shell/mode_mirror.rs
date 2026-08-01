@@ -70,11 +70,13 @@ pub fn baseline_host_modes(out: &mut impl Write) -> Result<()> {
 /// tracking is on. A/B in the same tmux window: dux (full stack) works,
 /// amux with only `1000h+1006h` was silent; injected SGR still worked.
 ///
-/// Leaves bracketed-paste alone (enabled separately at startup).
+/// Re-arms mouse + bracketed paste for Nav (paste must stay on so accidental
+/// clipboard dumps are wrapped in `\x1b[200~…\x1b[201~` and ignored as keys).
 pub fn apply_nav_host_modes(out: &mut impl Write) -> Result<()> {
     write!(
         out,
-        "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[?1004l\x1b[?1007l"
+        "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h\
+         \x1b[?1004l\x1b[?1007l\x1b[?2004h"
     )?;
     out.flush()?;
     Ok(())

@@ -40,8 +40,8 @@ use crate::mouse::{
     translate_sgr_mouse_clipped,
 };
 use crate::provider::{
-    load_transcript, refresh_disk_session, SessionDirEvent, SessionDirWatcher, TitleKind,
-    TranscriptLine, TranscriptRole,
+    delete_session_with_artifacts, load_transcript, refresh_disk_session, SessionDirEvent,
+    SessionDirWatcher, TitleKind, TranscriptLine, TranscriptRole,
 };
 use crate::pty::MirroredModes;
 use crate::raw_input::{is_sgr_mouse, RawInputParser};
@@ -74,6 +74,14 @@ enum Modal {
         id: String,
         name: String,
         live: usize,
+        yes_focused: bool,
+    },
+    /// Delete omp session jsonl + sibling artifacts dir.
+    ConfirmDeleteSession {
+        id: String,
+        title: String,
+        path: PathBuf,
+        live: bool,
         yes_focused: bool,
     },
 }
@@ -800,6 +808,15 @@ impl App {
             self.esc_deadline = Some(Instant::now() + Duration::from_millis(25));
         }
         for seq in seqs {
+            // Bracketed paste must not fire Nav shortcuts (q/n/j/Enter/…).
+            // Markers + payload are dropped; Agent path forwards instead.
+            if seq.in_bracket_paste
+                || seq.bytes == crate::raw_input::BRACKET_PASTE_START
+                || seq.bytes == crate::raw_input::BRACKET_PASTE_END
+            {
+                self.escape.clear();
+                continue;
+            }
             if is_sgr_mouse(&seq.bytes) {
                 if sgr_has_shift(&seq.bytes) {
                     continue; // outer terminal selection
@@ -890,6 +907,7 @@ impl App {
             b"J" => self.move_workspace(1),
             b"K" => self.move_workspace(-1),
             b"D" => self.open_remove_workspace()?,
+            b"d" => self.open_delete_session()?,
             b"\r" | b"\n" => self.attach_selected()?,
             b"x" => {
                 if let Some(s) = self.session_list.get(self.selected_session) {
@@ -941,6 +959,26 @@ impl App {
                     self.modal = Some(Modal::ConfirmRemoveWorkspace {
                         id,
                         name,
+                        live,
+                        yes_focused,
+                    });
+                    self.focus = Focus::Modal;
+                }
+            },
+            Modal::ConfirmDeleteSession {
+                id,
+                title,
+                path,
+                live,
+                mut yes_focused,
+            } => match confirm_key(seq, &mut yes_focused) {
+                ConfirmResult::Yes => self.confirm_delete_session(&id, &title, &path)?,
+                ConfirmResult::No => self.focus = Focus::Nav,
+                ConfirmResult::Keep => {
+                    self.modal = Some(Modal::ConfirmDeleteSession {
+                        id,
+                        title,
+                        path,
                         live,
                         yes_focused,
                     });
@@ -1001,6 +1039,63 @@ impl App {
         });
         self.focus = Focus::Modal;
         self.status.clear();
+        Ok(())
+    }
+
+    fn open_delete_session(&mut self) -> Result<()> {
+        let Some(s) = self.session_list.get(self.selected_session).cloned() else {
+            self.status = "No session to delete".into();
+            return Ok(());
+        };
+        let Some(path) = s.path.clone() else {
+            self.status = "Session has no disk file yet (close with x, or wait for uuid)".into();
+            return Ok(());
+        };
+        if !path.exists() {
+            self.status = format!("Session file missing: {}", path.display());
+            return Ok(());
+        }
+        self.modal = Some(Modal::ConfirmDeleteSession {
+            id: s.id,
+            title: s.title,
+            path,
+            live: s.live,
+            yes_focused: true,
+        });
+        self.focus = Focus::Modal;
+        self.status.clear();
+        Ok(())
+    }
+
+    fn confirm_delete_session(&mut self, id: &str, title: &str, path: &Path) -> Result<()> {
+        if self.focused_session_id.as_deref() == Some(id) && self.focus == Focus::Agent {
+            self.enter_nav()?;
+        }
+        let was_live = self.sessions.is_live(id);
+        if was_live {
+            self.sessions.close_session(id);
+        }
+        if self.focused_session_id.as_deref() == Some(id) {
+            self.focused_session_id = None;
+        }
+        match delete_session_with_artifacts(path) {
+            Ok(()) => {
+                self.refresh_sessions();
+                if self.selected_session >= self.session_list.len() {
+                    self.selected_session = self.session_list.len().saturating_sub(1);
+                }
+                self.status = if was_live {
+                    format!("Deleted session {title} (closed live first)")
+                } else {
+                    format!("Deleted session {title}")
+                };
+            }
+            Err(e) => {
+                self.refresh_sessions();
+                self.status = format!("delete session: {e:#}");
+            }
+        }
+        self.focus = Focus::Nav;
         Ok(())
     }
 
@@ -1693,6 +1788,7 @@ impl App {
                 ("j/k", "session"),
                 ("J/K", "workspace"),
                 ("D", "del ws"),
+                ("d", "del sess"),
                 ("x", "close"),
                 ("?", "help"),
                 ("q", "quit"),
@@ -1781,7 +1877,7 @@ impl App {
         };
         match modal {
             Modal::Help => {
-                draw_center_box_lines(f, area, &self.theme, " Help ", &help_lines(&self.theme));
+                draw_help_overlay(f, area, &self.theme);
             }
             Modal::ConfirmQuit { yes_focused } => {
                 draw_confirm_dialog(
@@ -1816,6 +1912,29 @@ impl App {
                     *yes_focused,
                 );
             }
+            Modal::ConfirmDeleteSession {
+                title,
+                live,
+                yes_focused,
+                ..
+            } => {
+                let mut body = vec![
+                    format!("Delete session \"{title}\"?"),
+                    "Removes jsonl + artifacts on disk (omp).".into(),
+                ];
+                if *live {
+                    body.push("Closes live PTY first.".into());
+                }
+                let refs: Vec<&str> = body.iter().map(|s| s.as_str()).collect();
+                draw_confirm_dialog(
+                    f,
+                    area,
+                    &self.theme,
+                    " Delete session ",
+                    &refs,
+                    *yes_focused,
+                );
+            }
             Modal::DirBrowser(browser) => {
                 draw_dir_browser(f, area, &self.theme, browser);
             }
@@ -1823,26 +1942,179 @@ impl App {
     }
 }
 
-fn help_lines<'a>(t: &'a Theme) -> Vec<Line<'a>> {
-    // Bright badges + hint_desc_fg — same pairing as dux help overlays
-    vec![
-        t.help_row("Ctrl-\\", "toggle Nav ↔ Agent (double-tap: literal to omp)"),
-        t.help_row("a", "add workspace (browser: o add · / search · g path)"),
-        t.help_row("D", "remove workspace (confirm; keeps omp files on disk)"),
-        t.help_row("n", "new omp session"),
-        t.help_row("Enter", "attach / resume selected session"),
-        t.help_row("j/k", "move session · K/J move workspace"),
-        t.help_row("x", "close live session"),
-        t.help_row("q", "quit (confirm)"),
-        t.help_row("click", "select workspace/session · Agent pane attaches"),
-        Line::from(""),
-        Line::from(t.desc_span(
-            "AgentMode: raw keys forward to omp (incl. Ctrl+C, Ctrl+B).",
-        )),
-        Line::from(t.desc_span("Nav: keys never reach omp.")),
-        Line::from(""),
-        t.help_row("Esc", "close help"),
-    ]
+/// dux-style Help: dim scrim + dark panel + cyan banners + key rows + footer.
+fn draw_help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.overlay_dim_bg)),
+        area,
+    );
+
+    let w = (area.width * 72 / 100).clamp(40, 88);
+    let h = (area.height * 70 / 100).clamp(16, area.height.saturating_sub(2).max(16));
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+
+    let panel_bg = theme.help_panel_bg;
+    let block = Block::default()
+        .title(Span::styled(
+            " Help ",
+            Style::default()
+                .fg(theme.text_fg)
+                .bg(panel_bg)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.overlay_border).bg(panel_bg))
+        .style(Style::default().bg(panel_bg).fg(theme.text_fg));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height < 3 || inner.width < 8 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(inner);
+    let content = chunks[0];
+    let hint = chunks[1];
+    let cw = content.width as usize;
+
+    let banner_style = Style::default()
+        .fg(theme.help_banner_fg)
+        .bg(theme.help_banner_bg)
+        .add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(theme.help_body_fg).bg(panel_bg);
+    let section_style = Style::default()
+        .fg(theme.help_section_fg)
+        .bg(panel_bg)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let desc_style = Style::default().fg(theme.hint_desc_fg).bg(panel_bg);
+
+    let push_banner = |lines: &mut Vec<Line>, title: &str| {
+        let pad = cw.saturating_sub(title.chars().count() + 2);
+        let text = format!(" {title}{}", " ".repeat(pad));
+        if !lines.is_empty() {
+            lines.push(Line::from(Span::styled("", body_style)));
+        }
+        lines.push(Line::from(Span::styled(text, banner_style)));
+        lines.push(Line::from(Span::styled("", body_style)));
+    };
+
+    let help_key_row = |key: &str, desc: &str| -> Line<'static> {
+        let pad = 14usize.saturating_sub(key.len() + 2);
+        let mut spans = vec![Span::styled("  ", Style::default().bg(panel_bg))];
+        spans.push(Span::styled(
+            "<",
+            Style::default().fg(theme.hint_bracket_fg).bg(panel_bg),
+        ));
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::default()
+                .fg(theme.hint_key_fg)
+                .bg(panel_bg)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            ">",
+            Style::default().fg(theme.hint_bracket_fg).bg(panel_bg),
+        ));
+        spans.push(Span::styled(
+            " ".repeat(pad),
+            Style::default().bg(panel_bg),
+        ));
+        spans.push(Span::styled(desc.to_string(), desc_style));
+        Line::from(spans)
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    push_banner(&mut lines, "About amux");
+    for s in [
+        "amux is a tmux-like control plane for omp coding-agent sessions.",
+        "Workspaces map to project dirs; each session is a real PTY.",
+        "Nav browses workspaces/sessions; Agent forwards keys to omp.",
+    ] {
+        lines.push(Line::from(Span::styled(s.to_string(), body_style)));
+    }
+
+    push_banner(&mut lines, "Keybindings");
+    lines.push(Line::from(Span::styled("Navigation", section_style)));
+    for (k, d) in [
+        ("Ctrl-\\", "toggle Nav ↔ Agent (double-tap: literal to omp)"),
+        ("j/k", "move session · K/J move workspace"),
+        ("Enter", "attach / resume selected session"),
+        ("click", "select workspace/session · Agent pane attaches"),
+        ("Esc", "close this help"),
+    ] {
+        lines.push(help_key_row(k, d));
+    }
+    lines.push(Line::from(Span::styled("", body_style)));
+    lines.push(Line::from(Span::styled("Workspace & session", section_style)));
+    for (k, d) in [
+        ("a", "add workspace (browser: o add · / search · g path)"),
+        ("D", "remove workspace (confirm; keeps omp files on disk)"),
+        ("n", "new omp session"),
+        ("d", "delete session (confirm; jsonl + artifacts)"),
+        ("x", "close live session (keep disk)"),
+        ("q", "quit amux (confirm)"),
+    ] {
+        lines.push(help_key_row(k, d));
+    }
+
+    push_banner(&mut lines, "Notes");
+    lines.push(Line::from(Span::styled(
+        "AgentMode: keys go to omp (Ctrl+C, Ctrl+B, …). Nav keys never reach omp.",
+        body_style,
+    )));
+    lines.push(Line::from(Span::styled(
+        "Bracketed paste in Nav is ignored so clipboard dumps cannot fire shortcuts.",
+        body_style,
+    )));
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(panel_bg))
+            .wrap(Wrap { trim: false }),
+        content,
+    );
+
+    // Footer hint bar (dux-style top border).
+    let hint_block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(theme.border_normal).bg(panel_bg))
+        .style(Style::default().bg(panel_bg));
+    let hint_inner = hint_block.inner(hint);
+    f.render_widget(hint_block, hint);
+    let mut hint_spans = vec![Span::styled(" ", Style::default().bg(panel_bg))];
+    hint_spans.push(Span::styled(
+        "<",
+        Style::default().fg(theme.hint_bracket_fg).bg(panel_bg),
+    ));
+    hint_spans.push(Span::styled(
+        "Esc",
+        Style::default()
+            .fg(theme.hint_key_fg)
+            .bg(panel_bg)
+            .add_modifier(Modifier::BOLD),
+    ));
+    hint_spans.push(Span::styled(
+        ">",
+        Style::default().fg(theme.hint_bracket_fg).bg(panel_bg),
+    ));
+    hint_spans.push(Span::styled(
+        " close help",
+        Style::default().fg(theme.hint_dim_desc_fg).bg(panel_bg),
+    ));
+    f.render_widget(
+        Paragraph::new(Line::from(hint_spans)).style(Style::default().bg(panel_bg)),
+        hint_inner,
+    );
 }
 
 /// Powerline separators (Nerd Font / Powerline glyphs, same as tmux/vim).
@@ -1999,36 +2271,6 @@ fn truncate_display(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(keep).collect();
     out.push('…');
     out
-}
-
-fn draw_center_box_lines(f: &mut Frame, area: Rect, theme: &Theme, title: &str, lines: &[Line]) {
-    // Help / large content: still a roomy overlay.
-    let w = (area.width * 70 / 100).clamp(40, 80);
-    let h = (area.height * 70 / 100).clamp(12, 30);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .title(Span::styled(
-            title,
-            Style::default().fg(theme.title_focused),
-        ))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.overlay_border))
-        .style(Style::default().bg(theme.overlay_bg).fg(theme.text_fg));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-    f.render_widget(
-        Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false }),
-        inner,
-    );
 }
 
 /// Compact GUI-style confirm: snug box + `[ Yes ]` / `[ No ]` buttons.

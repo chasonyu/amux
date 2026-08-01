@@ -40,9 +40,16 @@ pub struct Theme {
     pub hint_dim_desc_fg: Color,
     pub hint_bar_bg: Color,
     pub overlay_border: Color,
+    /// Confirm dialogs (Indexed slate — visible under WebSSH).
     pub overlay_bg: Color,
     pub overlay_dim_bg: Color,
     pub overlay_dim_fg: Color,
+    /// Help panel — dark like dux (`app_bg`), not the confirm slate.
+    pub help_panel_bg: Color,
+    pub help_banner_fg: Color,
+    pub help_banner_bg: Color,
+    pub help_body_fg: Color,
+    pub help_section_fg: Color,
     pub input_cursor_fg: Color,
     pub input_cursor_bg: Color,
     pub input_label_fg: Color,
@@ -97,6 +104,11 @@ impl Default for Theme {
             overlay_bg: OVERLAY_BG,
             overlay_dim_bg: OVERLAY_SCRIM,
             overlay_dim_fg: Color::Rgb(128, 128, 128),
+            help_panel_bg: Color::Indexed(234), // #1c1c1c — dux-like dark panel
+            help_banner_fg: Color::Rgb(20, 20, 20),
+            help_banner_bg: BRIGHT_CYAN,
+            help_body_fg: Color::Rgb(180, 180, 180),
+            help_section_fg: BRIGHT_CYAN,
             input_cursor_fg: Color::Rgb(0, 0, 0),
             input_cursor_bg: Color::Rgb(255, 255, 255),
             input_label_fg: Color::Rgb(255, 255, 255),
