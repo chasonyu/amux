@@ -1,5 +1,6 @@
 //! amux — terminal control plane wrapping coding-agent CLIs in real PTYs.
 
+pub mod appearance;
 pub mod config;
 pub mod escape;
 pub mod lock;
