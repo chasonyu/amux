@@ -44,8 +44,9 @@ use crate::mouse::{
     sgr_wheel_delta, translate_sgr_mouse_clipped,
 };
 use crate::provider::{
-    delete_session_with_artifacts, load, refresh_disk_session, render_blocks, RenderedLine,
-    SessionDirEvent, SessionDirWatcher, SpanStyle, TitleKind, TranscriptBlock, TranscriptRole,
+    delete_session_with_artifacts, load, refresh_disk_session, render_blocks, sanitize_session_title,
+    write_session_title, RenderedLine, SessionDirEvent, SessionDirWatcher, SpanStyle, TitleKind,
+    TranscriptBlock, TranscriptRole,
 };
 use crate::pty::MirroredModes;
 use crate::raw_input::{is_sgr_mouse, RawInputParser};
@@ -59,6 +60,7 @@ const TITLE_FALLBACK_POLL: Duration = Duration::from_secs(3);
 
 use self::dir_browser::{draw_dir_browser, BrowserResult, DirBrowser};
 use self::mode_mirror::{apply_host_modes, apply_nav_host_modes, baseline_host_modes, KbNegotiated};
+use self::text_input::LineInput;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -89,6 +91,14 @@ enum Modal {
         path: PathBuf,
         live: bool,
         yes_focused: bool,
+    },
+    /// Rename session (Nav `r`): live → inject `/rename`; disk → title slot.
+    RenameSession {
+        id: String,
+        path: Option<PathBuf>,
+        live: bool,
+        input: LineInput,
+        error: Option<String>,
     },
 }
 
@@ -1029,6 +1039,7 @@ impl App {
             b"K" => self.move_workspace(-1),
             b"D" => self.open_remove_workspace()?,
             b"d" => self.open_delete_session()?,
+            b"r" | b"R" => self.open_rename_session()?,
             b"\r" | b"\n" => self.attach_selected()?,
             b"x" => {
                 if let Some(s) = self.session_list.get(self.selected_session) {
@@ -1135,6 +1146,55 @@ impl App {
                     }
                 }
             },
+            Modal::RenameSession {
+                id,
+                path,
+                live,
+                mut input,
+                error: _,
+            } => match seq {
+                b"\x1b" => {
+                    self.focus = Focus::Nav;
+                }
+                b"\r" | b"\n" => {
+                    let draft = input.text.clone();
+                    match self.apply_rename_session(&id, path.as_deref(), live, &draft) {
+                        Ok(()) => {
+                            self.focus = Focus::Nav;
+                        }
+                        Err(msg) => {
+                            self.modal = Some(Modal::RenameSession {
+                                id,
+                                path,
+                                live,
+                                input,
+                                error: Some(msg),
+                            });
+                            self.focus = Focus::Modal;
+                        }
+                    }
+                }
+                _ => {
+                    if input.handle_seq(seq) {
+                        self.modal = Some(Modal::RenameSession {
+                            id,
+                            path,
+                            live,
+                            input,
+                            error: None,
+                        });
+                    } else {
+                        self.modal = Some(Modal::RenameSession {
+                            id,
+                            path,
+                            live,
+                            input,
+                            error: None,
+                        });
+                    }
+                    self.focus = Focus::Modal;
+                }
+            },
         }
         Ok(())
     }
@@ -1185,6 +1245,96 @@ impl App {
         });
         self.focus = Focus::Modal;
         self.status.clear();
+        Ok(())
+    }
+
+    fn open_rename_session(&mut self) -> Result<()> {
+        let Some(s) = self.session_list.get(self.selected_session).cloned() else {
+            self.status = "No session to rename".into();
+            return Ok(());
+        };
+        let live_running = s.live
+            && self
+                .sessions
+                .get(&s.id)
+                .is_some_and(|p| !p.is_exited());
+        if !live_running && s.path.as_ref().is_none_or(|p| !p.exists()) {
+            self.status =
+                "Session has no disk file yet — wait for uuid, or attach first".into();
+            return Ok(());
+        }
+        let mut input = LineInput::new();
+        input.set_text(s.title.clone());
+        self.modal = Some(Modal::RenameSession {
+            id: s.id,
+            path: s.path,
+            live: live_running,
+            input,
+            error: None,
+        });
+        self.focus = Focus::Modal;
+        self.status.clear();
+        Ok(())
+    }
+
+    /// Returns `Ok(())` on success, or `Err(message)` to keep the rename modal open.
+    fn apply_rename_session(
+        &mut self,
+        id: &str,
+        path: Option<&Path>,
+        live: bool,
+        draft: &str,
+    ) -> std::result::Result<(), String> {
+        let title =
+            sanitize_session_title(draft).ok_or_else(|| "Title cannot be empty".to_string())?;
+
+        if live {
+            let Some(pty) = self.sessions.get(id) else {
+                // Live flag stale — fall through to disk if possible.
+                return self.rename_session_on_disk(id, path, &title);
+            };
+            if pty.is_exited() {
+                return self.rename_session_on_disk(id, path, &title);
+            }
+            if !pty.is_ready() {
+                return Err("Session still starting — try again in a moment".into());
+            }
+            // Ctrl-U clears omp editor line, then slash-rename (spaces allowed).
+            let cmd = format!("\x15/rename {title}\n");
+            pty.enqueue_write(cmd.as_bytes())
+                .map_err(|e| format!("inject /rename: {e:#}"))?;
+            self.sessions.set_live_title(id, title.clone());
+            if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
+                s.title = title.clone();
+                s.title_kind = TitleKind::Official;
+            }
+            self.status = format!("Renamed (live) {title}");
+            return Ok(());
+        }
+
+        self.rename_session_on_disk(id, path, &title)
+    }
+
+    fn rename_session_on_disk(
+        &mut self,
+        id: &str,
+        path: Option<&Path>,
+        title: &str,
+    ) -> std::result::Result<(), String> {
+        let path = path.ok_or_else(|| {
+            "Session has no disk file yet — wait for uuid, or attach first".to_string()
+        })?;
+        if !path.exists() {
+            return Err(format!("Session file missing: {}", path.display()));
+        }
+        write_session_title(path, title).map_err(|e| format!("write title: {e:#}"))?;
+        self.sessions.set_live_title(id, title.to_string());
+        self.refresh_sessions();
+        if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
+            s.title = title.to_string();
+            s.title_kind = TitleKind::Official;
+        }
+        self.status = format!("Renamed {title}");
         Ok(())
     }
 
@@ -1979,6 +2129,7 @@ impl App {
                 ("Ctrl-\\", "agent"),
                 ("a", "add workspace"),
                 ("n", "new session"),
+                ("r", "rename"),
                 ("Enter", "attach"),
                 ("j/k", "session"),
                 ("J/K", "workspace"),
@@ -2133,6 +2284,9 @@ impl App {
             Modal::DirBrowser(browser) => {
                 draw_dir_browser(f, area, &self.theme, browser);
             }
+            Modal::RenameSession { input, error, .. } => {
+                draw_rename_dialog(f, area, &self.theme, input, error.as_deref());
+            }
         }
     }
 }
@@ -2250,6 +2404,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
         ("a", "add workspace (browser: o add · / search · g path)"),
         ("D", "remove workspace (confirm; keeps omp files on disk)"),
         ("n", "new omp session"),
+        ("r", "rename session (live: /rename · disk: title slot)"),
         ("d", "delete session (confirm; jsonl + artifacts)"),
         ("x", "close live session (keep disk)"),
         ("q", "quit amux (confirm)"),
@@ -2540,6 +2695,130 @@ fn draw_confirm_button(f: &mut Frame, area: Rect, theme: &Theme, label: &str, fo
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(fill_bg)),
         inner,
+    );
+}
+
+fn draw_rename_dialog(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    input: &LineInput,
+    error: Option<&str>,
+) {
+    let title = " Rename session ";
+    let prompt = "New name:";
+    let mut content_w = unicode_width::UnicodeWidthStr::width(title.trim()) as u16;
+    content_w = content_w.max(unicode_width::UnicodeWidthStr::width(prompt) as u16);
+    content_w = content_w.max(unicode_width::UnicodeWidthStr::width(input.text.as_str()) as u16 + 2);
+    if let Some(err) = error {
+        content_w = content_w.max(unicode_width::UnicodeWidthStr::width(err) as u16);
+    }
+    content_w = content_w.max(28);
+    let w = (content_w + 6).clamp(34, area.width.saturating_sub(4).max(34).min(58));
+    let h = if error.is_some() { 9 } else { 8 }.min(area.height.saturating_sub(2).max(8));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.title_focused)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.overlay_border))
+        .style(Style::default().bg(theme.overlay_bg).fg(theme.text_fg));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.overlay_bg)),
+        inner,
+    );
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // prompt
+            Constraint::Length(1), // input
+            Constraint::Length(1), // error or spacer
+            Constraint::Min(1),    // hint
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            prompt.to_string(),
+            Style::default()
+                .fg(theme.hint_desc_fg)
+                .bg(theme.overlay_bg),
+        )))
+        .style(Style::default().bg(theme.overlay_bg)),
+        chunks[0],
+    );
+
+    let cursor = input.cursor.min(input.text.len());
+    let (before, after) = input.text.split_at(cursor);
+    let mut spans = vec![
+        Span::styled(
+            " ",
+            Style::default().bg(theme.overlay_bg),
+        ),
+        Span::styled(
+            before.to_string(),
+            Style::default().fg(theme.text_fg).bg(theme.overlay_bg),
+        ),
+        Span::styled(
+            after.chars().next().map(|c| c.to_string()).unwrap_or_else(|| " ".into()),
+            Style::default()
+                .fg(theme.overlay_bg)
+                .bg(theme.text_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !after.is_empty() {
+        let rest: String = after.chars().skip(1).collect();
+        if !rest.is_empty() {
+            spans.push(Span::styled(
+                rest,
+                Style::default().fg(theme.text_fg).bg(theme.overlay_bg),
+            ));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.overlay_bg)),
+        chunks[1],
+    );
+
+    if let Some(err) = error {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                err.to_string(),
+                Style::default()
+                    .fg(theme.error)
+                    .bg(theme.overlay_bg),
+            )))
+            .style(Style::default().bg(theme.overlay_bg)),
+            chunks[2],
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Enter save · Esc cancel".to_string(),
+            Style::default()
+                .fg(theme.hint_dim_desc_fg)
+                .bg(theme.overlay_bg),
+        )))
+        .style(Style::default().bg(theme.overlay_bg)),
+        chunks[3],
     );
 }
 

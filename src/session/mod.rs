@@ -237,6 +237,14 @@ impl SessionSupervisor {
         }
     }
 
+    /// Optimistic sidebar title after Nav rename / `/rename` inject.
+    pub fn set_live_title(&mut self, id: &str, title: String) {
+        if let Some(entry) = self.live.get_mut(id) {
+            entry.title = title;
+            entry.title_kind = TitleKind::Official;
+        }
+    }
+
     /// When a new disk session appears whose `parentSession` points at a live
     /// session, omp has forked/branched in-process — move the PTY binding.
     fn reconcile_fork_rebinds(&mut self, workspace_id: &str, disk: &[OmpDiskSession]) {

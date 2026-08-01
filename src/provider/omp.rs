@@ -1,7 +1,7 @@
 //! OmpProvider: list disk sessions + build spawn/resume argv.
 
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -286,6 +286,148 @@ pub fn resolve_display_title(path: &Path, fallback_id: &str) -> (String, TitleKi
     (fallback_id.to_string(), TitleKind::Fallback)
 }
 
+/// Sanitize a user-facing session title (first line, strip controls, trim).
+pub fn sanitize_session_title(value: &str) -> Option<String> {
+    sanitize_session_name(Some(value))
+}
+
+/// Persist an official title into omp's fixed 256-byte JSONL title slot (`source: user`).
+///
+/// - Files that already have a fixed-width title slot: overwrite the first 256 bytes in place.
+/// - Legacy files (variable first line / no slot): prepend a fixed slot and rewrite the body.
+pub fn write_session_title(path: &Path, title: &str) -> Result<()> {
+    let title = sanitize_session_name(Some(title)).context("empty session title")?;
+    let updated_at = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let slot = serialize_title_slot(&title, Some("user"), &updated_at)
+        .context("serialize title slot")?;
+
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut head = [0u8; TITLE_SLOT_BYTES];
+    let n = file.read(&mut head)?;
+
+    if n >= TITLE_SLOT_BYTES && is_fixed_title_slot(&head) {
+        let mut out = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| format!("rewrite title slot {}", path.display()))?;
+        out.write_all(&slot)?;
+        out.flush()?;
+        return Ok(());
+    }
+
+    // Legacy / short header: keep body after the first line (or whole file if no title line).
+    let mut rest = Vec::new();
+    if n == 0 {
+        bail!("session file is empty: {}", path.display());
+    }
+    let text = std::str::from_utf8(&head[..n]).context("session file head is not utf-8")?;
+    let first = text.split('\n').next().unwrap_or("");
+    let skip_first = serde_json::from_str::<TitleLine>(first.trim_end())
+        .ok()
+        .is_some_and(|v| v.kind == "title");
+    if skip_first {
+        if let Some(idx) = head[..n].iter().position(|&b| b == b'\n') {
+            rest.extend_from_slice(&head[idx + 1..n]);
+        }
+        // else: title line without newline in head — drop the partial head
+    } else {
+        rest.extend_from_slice(&head[..n]);
+    }
+    file.read_to_end(&mut rest)?;
+
+    let tmp = path.with_extension("jsonl.amux-title-tmp");
+    {
+        let mut out = File::create(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        out.write_all(&slot)?;
+        out.write_all(&rest)?;
+        out.flush()?;
+    }
+    fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "replace {} with titled body ({})",
+            path.display(),
+            tmp.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn is_fixed_title_slot(head: &[u8; TITLE_SLOT_BYTES]) -> bool {
+    if head[TITLE_SLOT_BYTES - 1] != b'\n' {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(head) else {
+        return false;
+    };
+    let line = text.trim_end_matches('\n');
+    serde_json::from_str::<TitleLine>(line)
+        .ok()
+        .is_some_and(|v| v.kind == "title")
+}
+
+/// Build omp's fixed-width title slot (exactly [`TITLE_SLOT_BYTES`] including trailing newline).
+fn serialize_title_slot(
+    title: &str,
+    source: Option<&str>,
+    updated_at: &str,
+) -> Result<Vec<u8>> {
+    let truncated = truncate_title_for_slot(title, source, updated_at)?;
+    let unpadded = title_slot_line(&truncated, source, updated_at, "");
+    let unpadded_len = unpadded.len();
+    if unpadded_len > TITLE_SLOT_BYTES {
+        bail!("title slot metadata exceeds {TITLE_SLOT_BYTES} bytes");
+    }
+    let pad_len = TITLE_SLOT_BYTES - unpadded_len;
+    let line = title_slot_line(&truncated, source, updated_at, &" ".repeat(pad_len));
+    let bytes = line.into_bytes();
+    if bytes.len() != TITLE_SLOT_BYTES {
+        bail!(
+            "title slot length {} != {TITLE_SLOT_BYTES}",
+            bytes.len()
+        );
+    }
+    Ok(bytes)
+}
+
+fn title_slot_line(title: &str, source: Option<&str>, updated_at: &str, pad: &str) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), Value::String("title".into()));
+    obj.insert("v".into(), Value::from(1));
+    obj.insert("title".into(), Value::String(title.to_string()));
+    if let Some(src) = source {
+        obj.insert("source".into(), Value::String(src.to_string()));
+    }
+    obj.insert("updatedAt".into(), Value::String(updated_at.to_string()));
+    obj.insert("pad".into(), Value::String(pad.to_string()));
+    format!("{}\n", Value::Object(obj))
+}
+
+fn truncate_title_for_slot(
+    title: &str,
+    source: Option<&str>,
+    updated_at: &str,
+) -> Result<String> {
+    let chars: Vec<char> = title.chars().collect();
+    let mut low = 0usize;
+    let mut high = chars.len();
+    let mut best = String::new();
+    while low <= high {
+        let mid = (low + high) / 2;
+        let candidate: String = chars[..mid].iter().collect();
+        let line = title_slot_line(&candidate, source, updated_at, "");
+        if line.len() <= TITLE_SLOT_BYTES {
+            best = candidate;
+            low = mid + 1;
+        } else if mid == 0 {
+            bail!("title slot metadata exceeds fixed slot size");
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(best)
+}
+
 fn read_official_title(path: &Path) -> Option<String> {
     let mut f = File::open(path).ok()?;
     let mut buf = vec![0u8; TITLE_SLOT_BYTES];
@@ -459,25 +601,11 @@ mod which {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     fn write_title_slot(path: &Path, title: &str) {
-        for pad_len in 0..TITLE_SLOT_BYTES {
-            let obj = serde_json::json!({
-                "type": "title",
-                "v": 1,
-                "title": title,
-                "updatedAt": "2026-08-01T00:00:00.000Z",
-                "pad": " ".repeat(pad_len),
-            });
-            let mut out = serde_json::to_string(&obj).unwrap().into_bytes();
-            out.push(b'\n');
-            if out.len() == TITLE_SLOT_BYTES {
-                File::create(path).unwrap().write_all(&out).unwrap();
-                return;
-            }
-        }
-        panic!("unable to build {TITLE_SLOT_BYTES}-byte title slot");
+        let slot = serialize_title_slot(title, None, "2026-08-01T00:00:00.000Z").unwrap();
+        File::create(path).unwrap().write_all(&slot).unwrap();
     }
 
     #[test]
@@ -508,6 +636,49 @@ mod tests {
         let (title, kind) = resolve_display_title(&path, "abc");
         assert_eq!(kind, TitleKind::Official);
         assert_eq!(title, "你好世界");
+    }
+
+    #[test]
+    fn write_session_title_overlays_fixed_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        write_title_slot(&path, "old");
+        let mut f = File::options().append(true).open(&path).unwrap();
+        writeln!(f, r#"{{"type":"session","id":"abc"}}"#).unwrap();
+        let before = fs::metadata(&path).unwrap().len();
+
+        write_session_title(&path, "新名字").unwrap();
+        let after = fs::metadata(&path).unwrap().len();
+        assert_eq!(before, after, "in-place slot write must not change file length");
+
+        let (title, kind) = resolve_display_title(&path, "abc");
+        assert_eq!(kind, TitleKind::Official);
+        assert_eq!(title, "新名字");
+
+        let mut head = vec![0u8; TITLE_SLOT_BYTES];
+        File::open(&path).unwrap().read_exact(&mut head).unwrap();
+        let line = std::str::from_utf8(&head).unwrap().trim_end_matches('\n');
+        let v: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v.get("source").and_then(|s| s.as_str()), Some("user"));
+    }
+
+    #[test]
+    fn write_session_title_prepends_legacy_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        fs::write(
+            &path,
+            format!("{}\n", r#"{"type":"session","id":"abc"}"#),
+        )
+        .unwrap();
+
+        write_session_title(&path, "legacy rename").unwrap();
+        let (title, kind) = resolve_display_title(&path, "abc");
+        assert_eq!(kind, TitleKind::Official);
+        assert_eq!(title, "legacy rename");
+
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains(r#""type":"session""#), "{body}");
     }
 
     #[test]
