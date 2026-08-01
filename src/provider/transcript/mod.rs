@@ -10,7 +10,7 @@ mod util;
 use std::path::Path;
 
 pub use markdown::{render_markdown, MdKind, MdLine};
-pub use render::{render_blocks, RenderedLine};
+pub use render::{render_blocks, RenderedLine, RenderedSpan, SpanStyle};
 
 pub const COLLAPSED_LINES: usize = 3;
 pub const OUTPUT_COLLAPSED: usize = 3;
@@ -27,6 +27,7 @@ pub enum TranscriptRole {
     Tool,
     Thinking,
     Meta,
+    Custom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +65,8 @@ pub enum TranscriptBlock {
     },
     /// Compaction divider, unknown-provider notice, etc.
     Meta { text: String },
+    /// omp custom_message: typed label + markdown body.
+    Custom { custom_type: String, content: String },
     Spacer,
 }
 

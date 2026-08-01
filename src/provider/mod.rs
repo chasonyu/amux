@@ -7,6 +7,7 @@ pub use omp::{
     refresh_disk_session, session_artifacts_dir, OmpDiskSession, OmpProvider, TitleKind,
 };
 pub use transcript::{
-    load, render_blocks, RenderedLine, ToolKind, ToolStatus, TranscriptBlock, TranscriptRole,
+    load, render_blocks, RenderedLine, RenderedSpan, SpanStyle, ToolKind, ToolStatus,
+    TranscriptBlock, TranscriptRole,
 };
 pub use watch::{SessionDirEvent, SessionDirWatcher};

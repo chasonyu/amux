@@ -66,7 +66,7 @@ pub fn load(path: &Path) -> Vec<TranscriptBlock> {
                 push(
                     &mut out,
                     TranscriptBlock::Meta {
-                        text: format!("── compaction · {}", one_line(summary, TRUNCATE_TITLE)),
+                        text: format!("─── compacted · {} ───", one_line(summary, TRUNCATE_TITLE)),
                     },
                 );
             }
@@ -78,7 +78,7 @@ pub fn load(path: &Path) -> Vec<TranscriptBlock> {
                 push(
                     &mut out,
                     TranscriptBlock::Meta {
-                        text: format!("── branch · {}", one_line(summary, TRUNCATE_TITLE)),
+                        text: format!("─── branch · {} ───", one_line(summary, TRUNCATE_TITLE)),
                     },
                 );
             }
@@ -488,15 +488,11 @@ fn append_custom_message(v: &Value, out: &mut Vec<TranscriptBlock>) {
         .and_then(|t| t.as_str())
         .unwrap_or("custom");
     let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
-    let one = one_line(content, 120);
     push(
         out,
-        TranscriptBlock::Meta {
-            text: if one.is_empty() {
-                format!("[{ctype}]")
-            } else {
-                format!("[{ctype}] {one}")
-            },
+        TranscriptBlock::Custom {
+            custom_type: ctype.to_string(),
+            content: content.trim_end().to_string(),
         },
     );
 }

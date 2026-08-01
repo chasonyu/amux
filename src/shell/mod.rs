@@ -42,7 +42,7 @@ use crate::mouse::{
 };
 use crate::provider::{
     delete_session_with_artifacts, load, refresh_disk_session, render_blocks, RenderedLine,
-    SessionDirEvent, SessionDirWatcher, TitleKind, TranscriptBlock, TranscriptRole,
+    SessionDirEvent, SessionDirWatcher, SpanStyle, TitleKind, TranscriptBlock, TranscriptRole,
 };
 use crate::pty::MirroredModes;
 use crate::raw_input::{is_sgr_mouse, RawInputParser};
@@ -2557,54 +2557,65 @@ fn parse_sgr_xy(seq: &[u8]) -> Option<(u16, u16)> {
     Some((cx.saturating_sub(1), cy.saturating_sub(1)))
 }
 
-/// Map a rendered transcript line to ratatui (role → theme colors).
-/// Text already includes layout pad from `render_blocks` where applicable.
+/// Map a rendered transcript line to ratatui, honoring inline span styles.
+/// Spans carry per-fragment styling (bold/italic/code/heading/link/…); the
+/// role supplies the base color and, for User, the bubble background padded
+/// to the full width.
 fn rendered_line_to_ratatui(t: &Theme, rl: &RenderedLine, width: u16) -> Line<'static> {
-    match rl.role {
-        TranscriptRole::User => {
-            // Trailing space + pad to width for bubble background (omp userMessageBg).
-            let mut text = if rl.text.ends_with(' ') {
-                rl.text.clone()
-            } else {
-                format!("{} ", rl.text)
-            };
-            let w = unicode_width::UnicodeWidthStr::width(text.as_str());
-            let pad = (width as usize).saturating_sub(w);
-            if pad > 0 {
-                text.push_str(&" ".repeat(pad));
-            }
-            Line::from(Span::styled(
-                text,
-                Style::default()
-                    .fg(t.transcript_user_fg)
-                    .bg(t.transcript_user_bg),
-            ))
+    let base = match rl.role {
+        TranscriptRole::User => Style::default().fg(t.transcript_user_fg),
+        TranscriptRole::Assistant => Style::default().fg(t.transcript_assistant_fg),
+        TranscriptRole::Tool => Style::default().fg(t.transcript_tool_fg),
+        TranscriptRole::Thinking => {
+            Style::default().fg(t.transcript_thinking_fg).add_modifier(Modifier::ITALIC)
         }
-        TranscriptRole::Assistant => Line::from(Span::styled(
-            rl.text.clone(),
-            Style::default().fg(t.transcript_assistant_fg),
-        )),
-        TranscriptRole::Tool => Line::from(Span::styled(
-            rl.text.clone(),
-            Style::default().fg(t.transcript_tool_fg),
-        )),
-        TranscriptRole::Thinking => Line::from(Span::styled(
-            rl.text.clone(),
-            Style::default()
-                .fg(t.transcript_thinking_fg)
-                .add_modifier(Modifier::ITALIC),
-        )),
-        TranscriptRole::Meta => {
-            if rl.text.is_empty() {
-                Line::from("")
-            } else {
-                Line::from(Span::styled(
-                    rl.text.clone(),
-                    Style::default().fg(t.transcript_meta_fg),
-                ))
-            }
+        TranscriptRole::Meta => Style::default().fg(t.transcript_meta_fg),
+        TranscriptRole::Custom => Style::default().fg(t.transcript_assistant_fg),
+    };
+    let bg = if rl.role == TranscriptRole::User {
+        Some(t.transcript_user_bg)
+    } else {
+        None
+    };
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(rl.spans.len() + 1);
+    let mut w = 0usize;
+    for span in &rl.spans {
+        let mut style = base;
+        if let Some(bgc) = bg {
+            style = style.bg(bgc);
+        }
+        match span.style {
+            SpanStyle::Normal => {}
+            SpanStyle::Bold => style = style.add_modifier(Modifier::BOLD),
+            SpanStyle::Italic => style = style.add_modifier(Modifier::ITALIC),
+            SpanStyle::Code => style = style.fg(t.md_code),
+            SpanStyle::Heading => style = style.fg(t.md_heading).add_modifier(Modifier::BOLD),
+            SpanStyle::Link => style = style.fg(t.md_link).add_modifier(Modifier::UNDERLINED),
+            SpanStyle::Dim => style = style.fg(t.dim),
+            SpanStyle::ListBullet => style = style.fg(t.md_list_bullet),
+            SpanStyle::CodeBlock => style = style.fg(t.md_code_block),
+            SpanStyle::StatusOk => style = style.fg(t.success),
+            SpanStyle::StatusErr => style = style.fg(t.error),
+            SpanStyle::StatusPending => style = style.fg(t.dim),
+            SpanStyle::BashBorder => style = style.fg(t.bash_mode),
+            SpanStyle::EvalBorder => style = style.fg(t.python_mode),
+            SpanStyle::Accent => style = style.fg(t.accent),
+            SpanStyle::CustomLabel => style = style.fg(t.custom_message_label).add_modifier(Modifier::BOLD),
+        }
+        w += unicode_width::UnicodeWidthStr::width(span.text.as_str());
+        spans.push(Span::styled(span.text.clone(), style));
+    }
+    // User bubble: pad to width so the background fills the line.
+    if rl.role == TranscriptRole::User {
+        let pad = (width as usize).saturating_sub(w);
+        if pad > 0 {
+            spans.push(Span::styled(
+                " ".repeat(pad),
+                Style::default().fg(t.transcript_user_fg).bg(t.transcript_user_bg),
+            ));
         }
     }
+    Line::from(spans)
 }
 
 /// Compact relative time for session rows (e.g. "5m", "3h", "2d").

@@ -28,6 +28,23 @@ const LIGHT_TITLE_MUTED: Color = Color::Rgb(108, 108, 108); // mediumGray
 const LIGHT_TEAL: Color = Color::Rgb(90, 128, 128); // omp teal
 const LIGHT_OVERLAY_BG: Color = Color::Indexed(254); // near-white panel
 const LIGHT_OVERLAY_SCRIM: Color = Color::Indexed(252); // light veil
+/// omp transcript symbols (theme.ts symbol preset).
+const OMP_TREE_BRANCH: &str = "├─";
+const OMP_TREE_LAST: &str = "└─";
+const OMP_TREE_VERTICAL: &str = "│";
+const OMP_STATUS_OK: &str = "✔";
+const OMP_STATUS_ERR: &str = "✘";
+const OMP_STATUS_WARN: &str = "⚠";
+const OMP_STATUS_PENDING: &str = "⏳";
+const OMP_BULLET: &str = "•";
+const OMP_SEP_DOT: &str = " · ";
+/// omp rounded box glyphs (renderOutputBlock frame).
+const OMP_BOX_TL: &str = "╭";
+const OMP_BOX_TR: &str = "╮";
+const OMP_BOX_BL: &str = "╰";
+const OMP_BOX_BR: &str = "╯";
+const OMP_BOX_V: &str = "│";
+const OMP_BOX_H: &str = "─";
 
 #[derive(Debug, Clone)]
 pub struct Theme {
@@ -87,6 +104,36 @@ pub struct Theme {
     pub transcript_tool_fg: Color,
     pub transcript_thinking_fg: Color,
     pub transcript_meta_fg: Color,
+    /// omp semantic accent (amber on dark).
+    pub accent: Color,
+    pub border_muted: Color,
+    pub border_accent: Color,
+    pub success: Color,
+    pub error: Color,
+    pub warning: Color,
+    pub muted: Color,
+    pub dim: Color,
+    /// omp markdown semantic colors.
+    pub md_heading: Color,
+    pub md_link: Color,
+    pub md_code: Color,
+    pub md_code_block: Color,
+    pub md_code_block_border: Color,
+    pub md_quote: Color,
+    pub md_quote_border: Color,
+    pub md_hr: Color,
+    pub md_list_bullet: Color,
+    /// omp tool-card state backgrounds.
+    pub tool_success_bg: Color,
+    pub tool_error_bg: Color,
+    pub tool_pending_bg: Color,
+    pub tool_output: Color,
+    /// omp custom/compaction block colors.
+    pub custom_message_bg: Color,
+    pub custom_message_label: Color,
+    /// omp execution mode colors.
+    pub bash_mode: Color,
+    pub python_mode: Color,
 }
 
 impl Default for Theme {
@@ -151,6 +198,31 @@ impl Theme {
             transcript_tool_fg: Color::Rgb(120, 180, 200),
             transcript_thinking_fg: Color::Rgb(140, 140, 160),
             transcript_meta_fg: Color::Rgb(120, 120, 120),
+            accent: Color::Rgb(0xfe, 0xbc, 0x38),
+            border_muted: Color::Rgb(0x3d, 0x42, 0x4a),
+            border_accent: Color::Rgb(0x00, 0x88, 0xfa),
+            success: Color::Rgb(0x89, 0xd2, 0x81),
+            error: Color::Rgb(0xfc, 0x3a, 0x4b),
+            warning: Color::Rgb(0xe4, 0xc0, 0x0f),
+            muted: Color::Rgb(0x77, 0x7d, 0x88),
+            dim: Color::Rgb(0x5f, 0x66, 0x73),
+            md_heading: Color::Rgb(0xfe, 0xbc, 0x38),
+            md_link: Color::Rgb(0x00, 0x88, 0xfa),
+            md_code: Color::Rgb(0xe5, 0xc1, 0xff),
+            md_code_block: Color::Rgb(0x9c, 0xdc, 0xfe),
+            md_code_block_border: Color::Rgb(0x3d, 0x42, 0x4a),
+            md_quote: Color::Rgb(0x77, 0x7d, 0x88),
+            md_quote_border: Color::Rgb(0x3d, 0x42, 0x4a),
+            md_hr: Color::Rgb(0x3d, 0x42, 0x4a),
+            md_list_bullet: Color::Rgb(0xfe, 0xbc, 0x38),
+            tool_success_bg: Color::Rgb(0x16, 0x1a, 0x1f),
+            tool_error_bg: Color::Rgb(0x29, 0x1d, 0x1d),
+            tool_pending_bg: Color::Rgb(0x1d, 0x21, 0x29),
+            tool_output: Color::Rgb(0x77, 0x7d, 0x88),
+            custom_message_bg: Color::Rgb(0x2a, 0x25, 0x30),
+            custom_message_label: Color::Rgb(0xb2, 0x81, 0xd6),
+            bash_mode: Color::Rgb(0x00, 0x88, 0xfa),
+            python_mode: Color::Rgb(0xe4, 0xc0, 0x0f),
         }
     }
 
@@ -209,6 +281,31 @@ impl Theme {
             transcript_tool_fg: Color::Rgb(108, 108, 108), // mediumGray toolOutput
             transcript_thinking_fg: Color::Rgb(108, 108, 108), // thinkingText
             transcript_meta_fg: Color::Rgb(118, 118, 118), // dimGray
+            accent: LIGHT_TEAL,
+            border_muted: LIGHT_BORDER,
+            border_accent: Color::Rgb(0x00, 0x5f, 0x87),
+            success: Color::Rgb(0x50, 0x8c, 0x50),
+            error: Color::Rgb(0xc8, 0x3c, 0x3c),
+            warning: Color::Rgb(0xb4, 0x8c, 0x00),
+            muted: LIGHT_TITLE_MUTED,
+            dim: Color::Rgb(0x8c, 0x8c, 0x8c),
+            md_heading: LIGHT_TEAL,
+            md_link: Color::Rgb(0x00, 0x5f, 0x87),
+            md_code: Color::Rgb(0x78, 0x3c, 0x8c),
+            md_code_block: LIGHT_TEXT,
+            md_code_block_border: LIGHT_BORDER,
+            md_quote: LIGHT_TITLE_MUTED,
+            md_quote_border: LIGHT_BORDER,
+            md_hr: LIGHT_BORDER,
+            md_list_bullet: LIGHT_TEAL,
+            tool_success_bg: Color::Rgb(0xf0, 0xf0, 0xf0),
+            tool_error_bg: Color::Rgb(0xf0, 0xdc, 0xdc),
+            tool_pending_bg: Color::Rgb(0xeb, 0xeb, 0xeb),
+            tool_output: LIGHT_TITLE_MUTED,
+            custom_message_bg: Color::Rgb(0xee, 0xeb, 0xf2),
+            custom_message_label: Color::Rgb(0x8c, 0x5a, 0xaa),
+            bash_mode: Color::Rgb(0x00, 0x5f, 0x87),
+            python_mode: Color::Rgb(0xb4, 0x8c, 0x00),
         }
     }
 
