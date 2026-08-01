@@ -10,9 +10,10 @@ use serde_json::Value;
 
 use crate::provider::omp::skip_title_prefix;
 
+use super::util::{content_to_text, format_primary_arg, one_line};
+
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_LINES_OUT: usize = 4000;
-const TOOL_ARG_MAX: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptRole {
@@ -269,66 +270,6 @@ fn append_custom_message(v: &Value, out: &mut Vec<TranscriptLine>) {
             format!("[{ctype}] {one}")
         },
     });
-}
-
-fn content_to_text(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => {
-            let mut out = String::new();
-            for part in parts {
-                match part.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => {
-                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                            if !out.is_empty() {
-                                out.push('\n');
-                            }
-                            out.push_str(t);
-                        }
-                    }
-                    Some("image") => {
-                        if !out.is_empty() {
-                            out.push('\n');
-                        }
-                        out.push_str("[image]");
-                    }
-                    _ => {}
-                }
-            }
-            out
-        }
-        _ => String::new(),
-    }
-}
-
-fn format_primary_arg(args: Option<&Value>) -> String {
-    let Some(Value::Object(map)) = args else {
-        return String::new();
-    };
-    const KEYS: &[&str] = &[
-        "path", "file_path", "filePath", "command", "cmd", "pattern", "url", "query",
-        "prompt", "name", "id", "message",
-    ];
-    for k in KEYS {
-        if let Some(Value::String(s)) = map.get(*k) {
-            if !s.is_empty() {
-                return one_line(s, TOOL_ARG_MAX);
-            }
-        }
-    }
-    String::new()
-}
-
-fn one_line(text: &str, max: usize) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        format!(
-            "{}…",
-            flat.chars().take(max.saturating_sub(1)).collect::<String>()
-        )
-    }
 }
 
 #[cfg(test)]

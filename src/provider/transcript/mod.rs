@@ -4,6 +4,7 @@
 
 mod legacy;
 mod omp;
+mod util;
 
 use std::path::Path;
 

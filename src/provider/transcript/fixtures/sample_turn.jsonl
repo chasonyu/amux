@@ -1,0 +1,4 @@
+{"type":"title","v":1,"title":"","updatedAt":"t","pad":"                                                                                                                                                                                                     "}
+{"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "list files in src"}]}}
+{"type": "message", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "User wants a directory listing.\nI should run ls."}, {"type": "text", "text": "I'll list the src directory."}, {"type": "toolCall", "id": "call_bash_1", "name": "bash", "arguments": {"command": "ls src"}}, {"type": "text", "text": "Here is the listing above."}]}}
+{"type": "message", "message": {"role": "toolResult", "toolCallId": "call_bash_1", "toolName": "bash", "isError": false, "content": [{"type": "text", "text": "main.rs\nprovider\nshell"}]}}
