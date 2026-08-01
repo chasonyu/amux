@@ -3,6 +3,8 @@
 Date: 2026-08-01  
 Status: implemented (MVP)
 
+> Superseded by [docs/superpowers/specs/2026-08-01-transcript-render-design.md](../superpowers/specs/2026-08-01-transcript-render-design.md).
+
 ## Policy
 
 | Session state | Agent pane |

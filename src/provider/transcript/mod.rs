@@ -1,8 +1,7 @@
 //! Agent-neutral transcript blocks + provider dispatch.
 //!
-//! Line-based [`legacy`] parser remains for Task 8 cleanup; shell uses blocks + [`render`].
+//! Shell loads [`TranscriptBlock`] via [`load`] and draws with [`render`].
 
-mod legacy;
 mod markdown;
 mod omp;
 mod render;
@@ -10,7 +9,6 @@ mod util;
 
 use std::path::Path;
 
-pub use legacy::{TranscriptLine, TranscriptRole};
 pub use markdown::{render_markdown, MdKind, MdLine};
 pub use render::{render_blocks, RenderedLine};
 
@@ -20,6 +18,16 @@ pub const COLLAPSED_ITEMS: usize = 8;
 pub const TRUNCATE_LINE: usize = 110;
 pub const TRUNCATE_TITLE: usize = 60;
 pub const TRUNCATE_ARG: usize = 100;
+
+/// Display role used when mapping rendered lines to theme colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptRole {
+    User,
+    Assistant,
+    Tool,
+    Thinking,
+    Meta,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {

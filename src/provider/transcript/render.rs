@@ -2,10 +2,10 @@
 
 use crate::theme::Theme;
 
-use super::legacy::TranscriptRole;
 use super::markdown::render_markdown;
 use super::{
-    ToolKind, ToolStatus, TranscriptBlock, COLLAPSED_ITEMS, COLLAPSED_LINES, OUTPUT_COLLAPSED,
+    ToolKind, ToolStatus, TranscriptBlock, TranscriptRole, COLLAPSED_ITEMS, COLLAPSED_LINES,
+    OUTPUT_COLLAPSED,
 };
 
 const THINKING_DISPLAY_MAX: usize = 80;
@@ -52,11 +52,17 @@ pub fn render_blocks(blocks: &[TranscriptBlock], width: usize, theme: &Theme) ->
 fn render_one(block: &TranscriptBlock, width: usize, out: &mut Vec<RenderedLine>) {
     match block {
         TranscriptBlock::Spacer => {}
-        TranscriptBlock::User { text, .. } => {
+        TranscriptBlock::User { text, synthetic } => {
+            // Theme has a single User style; synthetic/developer → Meta (dimmer).
+            let role = if *synthetic {
+                TranscriptRole::Meta
+            } else {
+                TranscriptRole::User
+            };
             let md_width = width.saturating_sub(1).max(1);
             for line in render_markdown(text, md_width) {
                 out.push(RenderedLine {
-                    role: TranscriptRole::User,
+                    role,
                     text: format!(" {}", line.text),
                 });
             }
@@ -207,21 +213,25 @@ fn render_bash_eval(
 
     let mut truncated = output_preview.len() > OUTPUT_COLLAPSED;
     let show_out = output_preview.len().min(OUTPUT_COLLAPSED).min(COLLAPSED_LINES);
-    for line in output_preview.iter().take(show_out) {
-        out.push(RenderedLine {
-            role: TranscriptRole::Tool,
-            text: line.clone(),
-        });
-    }
     if output_preview.len() > show_out {
         truncated = true;
     }
-    if truncated {
-        if let Some(last) = out.last_mut() {
-            if !last.text.contains(EXPAND_HINT) {
-                last.text.push_str(EXPAND_HINT);
-            }
+    for i in 0..show_out {
+        let prefix = if i + 1 == show_out { "└─ " } else { "├─ " };
+        let mut text = format!("{prefix}{}", output_preview[i]);
+        if truncated && i + 1 == show_out {
+            text.push_str(EXPAND_HINT);
         }
+        out.push(RenderedLine {
+            role: TranscriptRole::Tool,
+            text,
+        });
+    }
+    if truncated && show_out == 0 {
+        out.push(RenderedLine {
+            role: TranscriptRole::Tool,
+            text: format!("└─ …{EXPAND_HINT}"),
+        });
     }
 
     out.push(RenderedLine {
@@ -253,6 +263,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::theme::Theme;
+    use std::path::PathBuf;
 
     #[test]
     fn tool_card_has_tree_prefix() {
@@ -299,5 +310,97 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(blanks.len(), 1);
+    }
+
+    #[test]
+    fn synthetic_user_uses_meta_role() {
+        let theme = Theme::dark();
+        let blocks = vec![TranscriptBlock::User {
+            text: "system note".into(),
+            synthetic: true,
+        }];
+        let lines = render_blocks(&blocks, 40, &theme);
+        assert!(lines.iter().any(|l| l.role == TranscriptRole::Meta));
+        assert!(!lines.iter().any(|l| l.role == TranscriptRole::User));
+    }
+
+    #[test]
+    fn bash_truncated_output_has_tree_prefix() {
+        let theme = Theme::dark();
+        let blocks = vec![TranscriptBlock::Tool {
+            name: "bash".into(),
+            title: "bash".into(),
+            status: ToolStatus::Ok,
+            arg_preview: vec!["ls".into()],
+            output_preview: vec![
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "d".into(),
+            ],
+            kind: ToolKind::Bash,
+        }];
+        let lines = render_blocks(&blocks, 60, &theme);
+        let joined = lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("$ ls"));
+        assert!(joined.contains("└─") || joined.contains("├─"));
+        assert!(joined.contains(EXPAND_HINT));
+    }
+
+    /// Manual: dump first 40 render lines from a real ~/.omp session (skip if none).
+    #[test]
+    #[ignore]
+    fn dump_real_omp_session_preview() {
+        use super::super::load;
+
+        let root = dirs_home_omp_sessions();
+        let Some(path) = find_newest_jsonl(&root) else {
+            eprintln!("no jsonl under {}; skip dump", root.display());
+            return;
+        };
+        let theme = Theme::dark();
+        let blocks = load("omp", &path);
+        let lines = render_blocks(&blocks, 80, &theme);
+        println!("=== {} ({} blocks, {} lines) ===", path.display(), blocks.len(), lines.len());
+        for (i, l) in lines.iter().take(40).enumerate() {
+            println!("{:02} [{:?}] {}", i, l.role, l.text);
+        }
+    }
+
+    fn dirs_home_omp_sessions() -> PathBuf {
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        PathBuf::from(home).join(".omp/agent/sessions")
+    }
+
+    fn find_newest_jsonl(root: &std::path::Path) -> Option<PathBuf> {
+        let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let mtime = ent
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+                    newest = Some((mtime, p));
+                }
+            }
+        }
+        newest.map(|(_, p)| p)
     }
 }
