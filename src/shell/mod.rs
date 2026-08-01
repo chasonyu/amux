@@ -41,8 +41,8 @@ use crate::mouse::{
     translate_sgr_mouse_clipped,
 };
 use crate::provider::{
-    delete_session_with_artifacts, load_transcript, refresh_disk_session, SessionDirEvent,
-    SessionDirWatcher, TitleKind, TranscriptLine, TranscriptRole,
+    delete_session_with_artifacts, load, refresh_disk_session, render_blocks, RenderedLine,
+    SessionDirEvent, SessionDirWatcher, TitleKind, TranscriptBlock, TranscriptRole,
 };
 use crate::pty::MirroredModes;
 use crate::raw_input::{is_sgr_mouse, RawInputParser};
@@ -156,7 +156,7 @@ struct TranscriptCache {
     path: PathBuf,
     mtime: DateTime<Utc>,
     size: u64,
-    lines: Vec<TranscriptLine>,
+    blocks: Vec<TranscriptBlock>,
 }
 
 impl App {
@@ -1683,7 +1683,7 @@ impl App {
             );
             return;
         };
-        self.ensure_transcript_cache(&path, summary.mtime, summary.size);
+        self.ensure_transcript_cache(&path, summary.mtime, summary.size, summary.provider);
         self.draw_transcript_preview(f, body);
     }
 
@@ -1742,7 +1742,13 @@ impl App {
         }
     }
 
-    fn ensure_transcript_cache(&mut self, path: &Path, mtime: DateTime<Utc>, size: u64) {
+    fn ensure_transcript_cache(
+        &mut self,
+        path: &Path,
+        mtime: DateTime<Utc>,
+        size: u64,
+        provider: &str,
+    ) {
         let fresh = self
             .transcript_cache
             .as_ref()
@@ -1750,12 +1756,12 @@ impl App {
         if fresh {
             return;
         }
-        let lines = load_transcript(path);
+        let blocks = load(provider, path);
         self.transcript_cache = Some(TranscriptCache {
             path: path.to_path_buf(),
             mtime,
             size,
-            lines,
+            blocks,
         });
     }
 
@@ -1768,11 +1774,12 @@ impl App {
         if h == 0 {
             return;
         }
-        let total = cache.lines.len();
+        let rendered = render_blocks(&cache.blocks, area.width as usize, t);
+        let total = rendered.len();
         let start = total.saturating_sub(h);
         let mut lines: Vec<Line> = Vec::with_capacity(h);
-        for tl in cache.lines.iter().skip(start) {
-            lines.push(transcript_line_to_ratatui(t, tl, area.width));
+        for rl in rendered.iter().skip(start) {
+            lines.push(rendered_line_to_ratatui(t, rl, area.width));
         }
         // Pad top if fewer lines than height (keep content at bottom like a chat).
         while lines.len() < h {
@@ -2550,53 +2557,58 @@ fn parse_sgr_xy(seq: &[u8]) -> Option<(u16, u16)> {
     Some((cx.saturating_sub(1), cy.saturating_sub(1)))
 }
 
-/// Compact relative time for session rows (e.g. "5m", "3h", "2d").
-/// Avoids pulling in a humanize crate. (§6.1 sessions show relative time)
-fn transcript_line_to_ratatui(t: &Theme, tl: &TranscriptLine, width: u16) -> Line<'static> {
-    let indent = " ";
-    match tl.role {
+/// Map a rendered transcript line to ratatui (role → theme colors).
+/// Text already includes layout pad from `render_blocks` where applicable.
+fn rendered_line_to_ratatui(t: &Theme, rl: &RenderedLine, width: u16) -> Line<'static> {
+    match rl.role {
         TranscriptRole::User => {
-            let text = format!("{indent}{} ", tl.text);
-            // Pad to width for bubble background (omp userMessageBg).
+            // Trailing space + pad to width for bubble background (omp userMessageBg).
+            let mut text = if rl.text.ends_with(' ') {
+                rl.text.clone()
+            } else {
+                format!("{} ", rl.text)
+            };
             let w = unicode_width::UnicodeWidthStr::width(text.as_str());
             let pad = (width as usize).saturating_sub(w);
-            let mut s = text;
             if pad > 0 {
-                s.push_str(&" ".repeat(pad));
+                text.push_str(&" ".repeat(pad));
             }
             Line::from(Span::styled(
-                s,
+                text,
                 Style::default()
                     .fg(t.transcript_user_fg)
                     .bg(t.transcript_user_bg),
             ))
         }
         TranscriptRole::Assistant => Line::from(Span::styled(
-            format!("{indent}{}", tl.text),
+            rl.text.clone(),
             Style::default().fg(t.transcript_assistant_fg),
         )),
         TranscriptRole::Tool => Line::from(Span::styled(
-            format!("{indent}{}", tl.text),
+            rl.text.clone(),
             Style::default().fg(t.transcript_tool_fg),
         )),
         TranscriptRole::Thinking => Line::from(Span::styled(
-            format!("{indent}{}", tl.text),
+            rl.text.clone(),
             Style::default()
                 .fg(t.transcript_thinking_fg)
                 .add_modifier(Modifier::ITALIC),
         )),
         TranscriptRole::Meta => {
-            if tl.text.is_empty() {
+            if rl.text.is_empty() {
                 Line::from("")
             } else {
                 Line::from(Span::styled(
-                    format!("{indent}{}", tl.text),
+                    rl.text.clone(),
                     Style::default().fg(t.transcript_meta_fg),
                 ))
             }
         }
     }
 }
+
+/// Compact relative time for session rows (e.g. "5m", "3h", "2d").
+/// Avoids pulling in a humanize crate. (§6.1 sessions show relative time)
 
 fn relative_time(t: DateTime<Utc>) -> String {
     let s = Utc::now().signed_duration_since(t).num_seconds().max(0);

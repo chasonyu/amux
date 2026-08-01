@@ -1,16 +1,18 @@
 //! Agent-neutral transcript blocks + provider dispatch.
 //!
-//! Line-based preview lives in [`legacy`] until Task 7 migrates the shell.
+//! Line-based [`legacy`] parser remains for Task 8 cleanup; shell uses blocks + [`render`].
 
 mod legacy;
 mod markdown;
 mod omp;
+mod render;
 mod util;
 
 use std::path::Path;
 
-pub use legacy::{load_transcript, TranscriptLine, TranscriptRole};
+pub use legacy::{TranscriptLine, TranscriptRole};
 pub use markdown::{render_markdown, MdKind, MdLine};
+pub use render::{render_blocks, RenderedLine};
 
 pub const COLLAPSED_LINES: usize = 3;
 pub const OUTPUT_COLLAPSED: usize = 3;
