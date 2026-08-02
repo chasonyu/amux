@@ -1,110 +1,179 @@
 # amux
 
-Terminal control plane that **wraps** coding-agent CLIs (first: **omp**) in real PTYs — no RPC re-paint, no omp fork.
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey)
+![omp](https://img.shields.io/badge/omp-17.2.1-purple)
+
+> Terminal control plane for coding-agent CLIs — wrap them in real PTYs, not RPC re-paint.
+
+amux runs your coding agent's **real TUI** inside a PTY. No fork, no RPC, no re-implementation of the agent's UI. Switch between sessions without killing background agents.
 
 ```
 ┌─────────────┬──────────────────────────┐
-│ workspaces  │                          │
-│ sessions    │   omp TUI (PTY + VT)     │
+│             │                          │
+│  Sidebar    │   Agent TUI (PTY + VT)   │
+│             │   omp / omp --resume     │
+│  workspaces │                          │
+│  sessions   │                          │
+│  status     │                          │
 │             │                          │
 └─────────────┴──────────────────────────┘
 ```
 
-Spec: [`docs/spec/2026-07-31-amux-design.md`](docs/spec/2026-07-31-amux-design.md)
+## Features
 
-## Requirements
+- **Real PTY embedding** — runs the stock `omp` CLI in a PTY; no fork/patch, so agent upgrades are painless
+- **Multi-session** — run several agent sessions side by side; switch without killing background processes
+- **Workspace management** — add project directories via a modal file browser
+- **Session discovery** — lists and resumes omp's on-disk sessions automatically
+- **Transcript preview** — omp-faithful markdown rendering for disk sessions
+- **Theme sync** — light/dark appearance probed from host terminal via OSC 11
+- **Transparent pipe** — AgentMode forwards raw bytes (kitty/modifyOtherKeys/UTF-8/mouse) verbatim to the agent
+- **Mouse + clipboard** — SGR mouse translate with four-edge clipping; OSC 52 clipboard pass-through
 
-- Linux or macOS
-- Rust 1.75+ (edition 2021)
-- [`omp`](https://github.com/nicobailon/oh-my-pi) on `PATH` (tested with **omp/17.2.1**), e.g. `~/.bun/bin/omp`
+## Prerequisites
 
-## Build & run
+| Requirement | Detail |
+|---|---|
+| OS | Linux or macOS (Windows not supported) |
+| Rust | 1.75+ (edition 2021) |
+| omp CLI | [`omp`](https://github.com/nicobailon/oh-my-pi) on `PATH` (tested with **omp/17.2.1**) |
+
+## Installation
+
+**From source:**
 
 ```bash
-cd opensource/amux
+git clone https://github.com/chasonyu/amux.git
+cd amux
 cargo build --release
-./target/release/amux
-
-# or
-cargo run --release
 ```
 
-Headless smoke (no TTY):
+The binary is at `./target/release/amux`. Add it to your `PATH` or copy it somewhere convenient:
 
 ```bash
-cargo test
-cargo run --release -- --smoke
+cp ./target/release/amux /usr/local/bin/   # or ~/.local/bin/
 ```
 
-Optional debug log: `AMUX_LOG=1 cargo run --release` → `~/.amux/amux.log`
+## Quick start
+
+```bash
+amux
+```
+
+1. Press **`a`** — add a workspace (browse to a project directory, `Enter` to confirm)
+2. Press **`n`** — start a new omp session in that workspace
+3. Press **`Enter`** — attach; you're now in **AgentMode** (omp's real TUI)
+4. Press **`Ctrl+\`** — toggle between Nav (sidebar) and AgentMode
+5. Press **`n`** again for a second session — the first stays alive in the background
+6. Press **`q`** then **`y`** — quit (kills all child processes, restores terminal)
 
 ## Keybindings
 
 | Binding | Mode | Action |
 |--------|------|--------|
 | `Ctrl+\` | Agent | Toggle → Nav |
-| `Ctrl+\` `Ctrl+\` (≤500ms) | Agent | Forward one literal `\x1c` to omp; stay Agent |
+| `Ctrl+\` `Ctrl+\` (≤500ms) | Agent | Forward one literal `\x1c`; stay Agent |
 | `Ctrl+\` | Nav | Toggle → AgentMode (if a session is focused) |
 | most keys | Agent | Raw-forward to omp (incl. `Ctrl+C`, `Ctrl+B`) |
-| `a` | Nav | Add workspace (centered directory browser) |
+| `a` | Nav | Add workspace (directory browser) |
 | `n` | Nav | New `omp --cwd <workspace>` session |
 | `Enter` | Nav | Attach / `omp --resume <id>` (lazy PTY spawn) |
 | `j` / `k` | Nav | Move session selection |
 | `J` / `K` | Nav | Move workspace selection |
-| `x` | Nav | Close focused live session (kill that PTY only) |
+| `r` | Nav | Rename focused session |
+| `x` | Nav | Close focused live session |
 | `?` | Nav | Help |
 | `q` then `y` | Nav | Quit amux (kills all live children) |
 
 Nav keys never reach omp. AgentMode is a transparent pipe with a tiny intercept set (`Ctrl+\` only).
 
-## Data
+## Configuration
+
+### Data paths
 
 | Path | Purpose |
 |------|---------|
 | `~/.amux/workspaces.json` | Manually added workspaces |
 | `~/.amux/locks/<session>.lock` | flock occupied detection |
-| `~/.amux/config.json` | Optional: `omp_bin`, `pi_pins`, `escape_key`, `session_dir`, `profile` |
+| `~/.amux/config.json` | Optional config (see below) |
 | `~/.omp/agent/sessions/<cwd-key>/` | omp on-disk sessions (listed by amux) |
 
-## Manual acceptance
+### Optional config (`~/.amux/config.json`)
 
-With a real TTY:
+```json
+{
+  "omp_bin": "~/.bun/bin/omp",
+  "escape_key": "\\x1c",
+  "session_dir": "~/.omp/agent/sessions",
+  "profile": null
+}
+```
 
-1. **Add workspace** — press `a`, browse to a project, `Enter` on the directory (use `.` for current). Confirm it appears in the sidebar and in `~/.amux/workspaces.json`.
-2. **E1** — attach a session, type CJK/emoji in AgentMode; columns should not drift vs bare `omp`.
-3. **E2** — AgentMode `Ctrl+C` reaches omp; amux stays alive.
-4. **E3** — `Ctrl+\` → Nav (sidebar chrome active).
-5. **E3b** — double `Ctrl+\` within 500ms → one literal to omp; stay AgentMode.
-6. **Dual session** — `n` for session A, `Ctrl+\` back to shell, select another / `n` again for B, `Enter`; switch with `Ctrl+\` + select; background session stays live (`live` chip).
-7. **Quit** — `q` `y`; no orphan `omp`; terminal modes restored.
+### Debug log
 
-## Known limitations (MVP)
+```bash
+AMUX_LOG=1 amux   # writes to ~/.amux/amux.log
+```
 
-- Kitty keyboard: enabled only when outer `TERM`/`TERM_PROGRAM` looks capable; otherwise status shows `Shift+Enter unavailable`.
-- OSC 52: store pass-through to outer terminal; clipboard **load** replies empty string (must not swallow).
-- No host copy-mode — use outer terminal Shift+drag selection.
-- Pixel mouse (1016) unsupported.
-- New sessions use synthetic ids (`new-N`) until omp persists a disk id; resume list refreshes from disk on next list.
-- Writer backpressure surfaces as status text; UI does not block on PTY write.
-- Advanced host 2026 frame wrap / DECTCEM hardware cursor polish is best-effort.
+## How it works
 
-## Architecture (crate layout)
+amux is a dual-pane TUI built with [ratatui](https://ratatui.rs/) and [crossterm](https://github.com/crossterm-rs/crossterm):
 
 ```
-src/
-  main.rs           CLI entry
-  raw_input.rs      CSI/OSC/UTF-8 sequence splitter (+ tests)
-  escape.rs         Ctrl+\ double-tap (+ tests)
-  mouse.rs          SGR translate + four-edge clip (+ tests)
-  config/           ~/.amux config + PI_* pins
-  workspace/        WorkspaceStore
-  provider/omp.rs   list/spawn/resume + cwd encoding
-  lock.rs           flock + pgrep
-  pty/              PtySession: portable-pty, alacritty_terminal, writer queue, stop_sync
-  session/          SessionSupervisor
-  shell/            ratatui dual-pane, modal browser, mode mirror
+┌────────────────────────────────────────────────────────────┐
+│ amux (Rust TUI)                                           │
+│                                                            │
+│  ┌──────────────┐   ┌──────────────────────────────────┐   │
+│  │ Sidebar      │   │ PtySurface (focused session)    │   │
+│  │ workspaces   │   │ VT grid ←→ PTY master            │   │
+│  │ sessions     │   │ child: omp / omp --resume …     │   │
+│  └──────┬───────┘   └──────────────▲───────────────────┘   │
+│         │                          │                       │
+│         ▼                          │                       │
+│  SessionSupervisor ──── Provider registry (v1: OmpProvider) │
+│  lazy spawn · multi-session       spawn / resume / list    │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Two modes:**
+
+- **Nav** — amux owns input; sidebar navigation, workspace/session management. No bytes reach the agent PTY.
+- **AgentMode** — transparent pipe; raw bytes forward verbatim to omp. Only `Ctrl+\` is intercepted.
+
+**PTY lifecycle:** lazy spawn on first attach; keep alive until explicit close or amux exit. Switching sessions rebinds the surface — background sessions continue running.
+
+For the full design spec, see [`docs/spec/2026-07-31-amux-design.md`](docs/spec/2026-07-31-amux-design.md).
+
+## Known limitations
+
+- Kitty keyboard: enabled only when the outer terminal looks capable; otherwise Shift+Enter / Ctrl+Enter unavailable (shown in status).
+- No host copy-mode — use the outer terminal's Shift+drag selection; OSC 52 pass-through supported.
+- Pixel mouse (mode 1016) unsupported.
+- New sessions use synthetic IDs (`new-N`) until omp persists a disk ID.
+
+## Development
+
+```bash
+cargo build            # debug build
+cargo test             # unit tests
+cargo run -- --smoke   # headless smoke test (no TTY required)
+AMUX_LOG=1 cargo run   # debug log → ~/.amux/amux.log
+```
+
+## Contributing
+
+Pull requests are welcome. For major changes, please open an issue first to discuss what you'd like to change.
+
+```bash
+git checkout -b feat/your-feature
+# make changes
+cargo build && cargo test
+git push origin feat/your-feature
+# open a PR on GitHub
 ```
 
 ## License
 
-MIT (this tree). Do not copy large portions of third-party projects with unclear licensing.
+MIT
