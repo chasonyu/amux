@@ -34,8 +34,8 @@ use signal_hook::consts::signal::{SIGHUP, SIGWINCH};
 use signal_hook::flag as signal_flag;
 
 use crate::appearance::{
-    host_surface_from_osc11_seq, is_da1_reply, parse_mode2031_dsr, probe_host_surface, Appearance,
-    HostSurface,
+    host_surface_from_osc11_seq, is_da1_reply, is_inside_tmux, osc11_query, parse_mode2031_dsr,
+    probe_host_surface, Appearance, HostSurface,
 };
 use crate::config::{AmuxConfig, AppearanceMode};
 use crate::theme::Theme;
@@ -343,7 +343,8 @@ impl App {
                 );
                 self.apply_host_surface(HostSurface::fallback(reported));
             }
-            let _ = write!(io::stdout(), "\x1b]11;?\x07");
+            // Re-query RGB; inside tmux must DCS-wrap or the outer client never answers.
+            let _ = io::stdout().write_all(&osc11_query(is_inside_tmux()));
             return true;
         }
         false

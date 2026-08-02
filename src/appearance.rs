@@ -166,15 +166,61 @@ pub fn colorfgbg_env(appearance: Appearance) -> Option<&'static str> {
     }
 }
 
+/// Whether this process is nested under tmux (`TMUX` set and non-empty).
+pub fn is_inside_tmux() -> bool {
+    std::env::var_os("TMUX").is_some_and(|v| !v.is_empty())
+}
+
+/// Wrap a control sequence in tmux's DCS passthrough envelope (`ESC P tmux;… ESC \`).
+///
+/// Bare OSC 10/11 queries are answered locally by tmux (DA1 only) and never reach
+/// the outer client; doubling ESC and framing with `tmux;` forwards them so the
+/// real terminal can reply with rgb (same technique as omp/pi-tui).
+pub fn wrap_tmux_passthrough(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len().saturating_mul(2).saturating_add(8));
+    out.extend_from_slice(b"\x1bPtmux;");
+    for &b in payload {
+        if b == 0x1b {
+            out.push(0x1b);
+            out.push(0x1b);
+        } else {
+            out.push(b);
+        }
+    }
+    out.extend_from_slice(b"\x1b\\");
+    out
+}
+
+/// OSC 10 + OSC 11 + DA1 probe bytes (DCS-wrapped when `inside_tmux`).
+pub fn host_surface_probe_query(inside_tmux: bool) -> Vec<u8> {
+    const PAYLOAD: &[u8] = b"\x1b]10;?\x07\x1b]11;?\x07\x1b[c";
+    if inside_tmux {
+        wrap_tmux_passthrough(PAYLOAD)
+    } else {
+        PAYLOAD.to_vec()
+    }
+}
+
+/// Single OSC 11 re-query (DCS-wrapped when `inside_tmux`).
+pub fn osc11_query(inside_tmux: bool) -> Vec<u8> {
+    const PAYLOAD: &[u8] = b"\x1b]11;?\x07";
+    if inside_tmux {
+        wrap_tmux_passthrough(PAYLOAD)
+    } else {
+        PAYLOAD.to_vec()
+    }
+}
+
 /// Probe host FG/BG via OSC 10 + 11 + DA1 sentinel.
 ///
 /// **Callers must disable ICANON/ECHO first** (e.g. `enable_raw_mode`).
+/// Inside tmux, the query is DCS-wrapped so the outer client can answer.
 pub fn probe_host_surface(
     out: &mut impl Write,
     input: &mut (impl Read + AsRawFd),
 ) -> HostSurface {
     let fd = input.as_raw_fd();
-    probe_host_surface_inner(out, input, Some(fd))
+    probe_host_surface_inner(out, input, Some(fd), is_inside_tmux())
 }
 
 /// Convenience: appearance-only (tests / callers that ignore RGB).
@@ -203,10 +249,11 @@ fn probe_host_surface_inner(
     out: &mut impl Write,
     input: &mut impl Read,
     poll_fd: Option<RawFd>,
+    inside_tmux: bool,
 ) -> HostSurface {
-    // OSC 10 fg + OSC 11 bg, then DA1 sentinel.
+    // OSC 10 fg + OSC 11 bg, then DA1 sentinel (tmux: DCS passthrough).
     if out
-        .write_all(b"\x1b]10;?\x07\x1b]11;?\x07\x1b[c")
+        .write_all(&host_surface_probe_query(inside_tmux))
         .is_err()
     {
         return finalize_surface(&[]);
@@ -338,10 +385,10 @@ mod tests {
         let mut out = Vec::new();
         let reply = b"\x1b]11;rgb:eeee/eeee/eeee\x07\x1b[?1;2c";
         let mut input = Cursor::new(reply.as_slice());
-        let surface = probe_host_surface_inner(&mut out, &mut input, None);
+        let surface = probe_host_surface_inner(&mut out, &mut input, None, false);
         assert_eq!(surface.appearance, Appearance::Light);
         assert_eq!(surface.bg, (0xee, 0xee, 0xee));
-        assert_eq!(out.as_slice(), b"\x1b]10;?\x07\x1b]11;?\x07\x1b[c");
+        assert_eq!(out.as_slice(), host_surface_probe_query(false).as_slice());
     }
 
     #[test]
@@ -350,7 +397,7 @@ mod tests {
         // Same shade the user terminal returned earlier.
         let reply = b"\x1b]10;rgb:dddd/dddd/dddd\x07\x1b]11;rgb:d5d5/dddd/e0e0\x07\x1b[?1;2c";
         let mut input = Cursor::new(reply.as_slice());
-        let surface = probe_host_surface_inner(&mut out, &mut input, None);
+        let surface = probe_host_surface_inner(&mut out, &mut input, None, false);
         assert_eq!(surface.appearance, Appearance::Light);
         assert_eq!(surface.bg, (0xd5, 0xdd, 0xe0));
         assert_eq!(surface.fg, (0xdd, 0xdd, 0xdd));
@@ -361,7 +408,7 @@ mod tests {
         let mut out = Vec::new();
         let reply = b"\x1b]11;rgb:1e1e/1e2e/3e3e\x07\x1b[?1;2c";
         let mut input = Cursor::new(reply.as_slice());
-        let surface = probe_host_surface_inner(&mut out, &mut input, None);
+        let surface = probe_host_surface_inner(&mut out, &mut input, None, false);
         assert_eq!(surface.appearance, Appearance::Dark);
         assert_eq!(surface.bg, (0x1e, 0x1e, 0x3e));
         assert_ne!(surface.bg, (0, 0, 0));
@@ -373,7 +420,7 @@ mod tests {
         let reply = b"\x1b[?1;2c";
         let mut input = Cursor::new(reply.as_slice());
         let started = Instant::now();
-        let surface = probe_host_surface_inner(&mut out, &mut input, None);
+        let surface = probe_host_surface_inner(&mut out, &mut input, None, false);
         assert_eq!(surface.appearance, Appearance::Dark);
         assert_eq!(surface.bg, (0, 0, 0));
         assert!(started.elapsed() >= Duration::from_millis(150));
@@ -384,7 +431,7 @@ mod tests {
         let mut out = Vec::new();
         let reply = b"\x1b[?1;2c\x1b]11;rgb:eeee/eeee/eeee\x07";
         let mut input = Cursor::new(reply.as_slice());
-        let surface = probe_host_surface_inner(&mut out, &mut input, None);
+        let surface = probe_host_surface_inner(&mut out, &mut input, None, false);
         assert_eq!(surface.appearance, Appearance::Light);
         assert_eq!(surface.bg, (0xee, 0xee, 0xee));
     }
@@ -394,7 +441,7 @@ mod tests {
         let mut out = Vec::new();
         let mut input = Cursor::new(&[][..]);
         let started = Instant::now();
-        let surface = probe_host_surface_inner(&mut out, &mut input, None);
+        let surface = probe_host_surface_inner(&mut out, &mut input, None, false);
         let elapsed = started.elapsed();
         assert_eq!(surface.appearance, Appearance::Dark);
         assert!(elapsed >= Duration::from_millis(150));
@@ -442,5 +489,41 @@ mod tests {
         let surface = host_surface_from_osc11_seq(seq).unwrap();
         assert_eq!(surface.appearance, Appearance::Light);
         assert_eq!(surface.bg, (0xd5, 0xdd, 0xe0));
+    }
+
+    #[test]
+    fn wrap_tmux_passthrough_doubles_esc_and_frames_dcs() {
+        let wrapped = wrap_tmux_passthrough(b"\x1b]11;?\x07");
+        assert!(wrapped.starts_with(b"\x1bPtmux;"));
+        assert!(wrapped.ends_with(b"\x1b\\"));
+        // Payload ESC is doubled; BEL is not.
+        let inner = &wrapped[7..wrapped.len() - 2];
+        assert_eq!(inner, b"\x1b\x1b]11;?\x07");
+    }
+
+    #[test]
+    fn host_surface_probe_query_wraps_inside_tmux() {
+        let raw = host_surface_probe_query(false);
+        assert_eq!(raw, b"\x1b]10;?\x07\x1b]11;?\x07\x1b[c");
+        let wrapped = host_surface_probe_query(true);
+        assert_eq!(wrapped, wrap_tmux_passthrough(b"\x1b]10;?\x07\x1b]11;?\x07\x1b[c"));
+        assert_ne!(raw, wrapped);
+    }
+
+    #[test]
+    fn osc11_query_wraps_inside_tmux() {
+        assert_eq!(osc11_query(false), b"\x1b]11;?\x07");
+        assert_eq!(osc11_query(true), wrap_tmux_passthrough(b"\x1b]11;?\x07"));
+    }
+
+    #[test]
+    fn probe_writes_tmux_wrapped_query_when_inside_tmux() {
+        let mut out = Vec::new();
+        let reply = b"\x1b]11;rgb:f8f8/f8f8/ffff\x07\x1b[?1;2c";
+        let mut input = Cursor::new(reply.as_slice());
+        let surface = probe_host_surface_inner(&mut out, &mut input, None, true);
+        assert_eq!(surface.appearance, Appearance::Light);
+        assert_eq!(surface.bg, (0xf8, 0xf8, 0xff));
+        assert_eq!(out.as_slice(), host_surface_probe_query(true).as_slice());
     }
 }
