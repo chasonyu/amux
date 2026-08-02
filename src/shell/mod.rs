@@ -2,6 +2,7 @@
 
 pub mod dir_browser;
 pub mod mode_mirror;
+mod selection;
 mod text_input;
 
 use std::collections::{HashMap, HashSet};
@@ -43,6 +44,10 @@ use crate::mouse::{
     list_row_index, point_in_rect, sgr_has_shift, sgr_is_button_press, sgr_is_release,
     sgr_wheel_delta, translate_sgr_mouse_clipped,
 };
+use self::selection::{
+    grid_from_plain_lines, osc52_clipboard_set, paint_selection_overlay, sgr_has_meta,
+    sgr_is_left_button, sgr_is_motion, text_from_snapshot, PaneSelection,
+};
 use crate::provider::{
     agent_turn_busy, delete_session_with_artifacts, load, refresh_disk_session, render_blocks,
     sanitize_session_title, write_session_title, RenderedLine, SessionDirEvent, SessionDirWatcher,
@@ -57,6 +62,8 @@ const TITLE_WATCH_DEBOUNCE: Duration = Duration::from_millis(80);
 /// Wheel notches → emulator history lines.
 const WHEEL_SCROLL_LINES: i32 = 2;
 const TITLE_FALLBACK_POLL: Duration = Duration::from_secs(3);
+/// Session-list double-click → attach (same as Enter).
+const SESSION_DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 use self::dir_browser::{draw_dir_browser, BrowserResult, DirBrowser};
 use self::mode_mirror::{apply_host_modes, apply_nav_host_modes, baseline_host_modes, KbNegotiated};
@@ -168,6 +175,10 @@ pub struct App {
     anim_t0: Instant,
     /// Cached JSONL transcript for the Agent preview pane.
     transcript_cache: Option<TranscriptCache>,
+    /// Host-owned pane-clipped text selection (Agent content area).
+    pane_sel: Option<PaneSelection>,
+    /// Last session-row click for double-click attach `(when, index)`.
+    last_session_click: Option<(Instant, usize)>,
 }
 
 struct TranscriptCache {
@@ -231,6 +242,8 @@ impl App {
             last_title_poll: Instant::now(),
             anim_t0: Instant::now(),
             transcript_cache: None,
+            pane_sel: None,
+            last_session_click: None,
         })
     }
 
@@ -799,24 +812,21 @@ impl App {
                 }
             }
 
-            // Mouse: shift yield; in-pane wheel → scroll PTY history (host);
+            // Mouse: pane-clipped host selection; in-pane wheel → scroll;
             // other in-pane → forward only if child wants mouse; sidebar press
             // → Nav/select. Host keeps 1000+1006 so chrome clicks work even
             // when the child has not enabled mouse.
             if is_sgr_mouse(&seq.bytes) {
-                if sgr_has_shift(&seq.bytes) {
-                    continue; // outer terminal selection
-                }
                 let area = self.pty_area;
-                let child_wants_mouse = self
-                    .focused_session_id
-                    .as_ref()
-                    .and_then(|id| self.sessions.get(id))
-                    .map(|pty| {
-                        let m = pty.mirrored_modes();
-                        m.mouse_1000 || m.mouse_1002 || m.mouse_1003
-                    })
-                    .unwrap_or(false);
+                let child_wants_mouse = self.focused_child_wants_mouse();
+                // In-flight host selection tracks the pointer even outside the pane
+                // (clamped) so a drag into the sidebar does not abort mid-gesture.
+                if self.pane_sel.is_some()
+                    && sgr_is_left_button(&seq.bytes)
+                    && self.handle_pane_selection_sgr(&seq.bytes)?
+                {
+                    continue;
+                }
                 if let Some(translated) = translate_sgr_mouse_clipped(
                     &seq.bytes,
                     area.x,
@@ -824,18 +834,20 @@ impl App {
                     area.width,
                     area.height,
                 ) {
-                    // Host-scroll emulator history (scheme 1). Wheel up → older.
-                    // If alt-screen has no history, fall back to child mouse.
                     if let Some(wheel) = sgr_wheel_delta(&seq.bytes) {
-                        // Same surface scroll as Nav: history / preview, no focus change.
                         let scrolled = self.scroll_agent_pane(wheel);
                         if !scrolled && child_wants_mouse {
                             self.route_agent_bytes(&translated)?;
                         }
                         continue;
                     }
+                    // Host selection: no child mouse / Shift|Alt+drag.
+                    if self.should_host_select(&seq.bytes, child_wants_mouse)
+                        && self.handle_pane_selection_sgr(&seq.bytes)?
+                    {
+                        continue;
+                    }
                     if child_wants_mouse {
-                        // Track button-down only when forwarding in-pane (B2).
                         if sgr_is_release(&seq.bytes) {
                             self.mouse_button_down = false;
                         } else if sgr_is_button_press(&seq.bytes) {
@@ -848,10 +860,8 @@ impl App {
                         }
                         self.route_agent_bytes(&translated)?;
                     }
-                    // else: child ignored mouse — swallow non-wheel in-pane
                 } else if sgr_is_button_press(&seq.bytes) {
-                    // Outside PTY inner: sidebar press → Nav/select only.
-                    // Do not set mouse_button_down (no fake release on enter_nav).
+                    self.pane_sel = None;
                     if let Some((x, y)) = parse_sgr_xy(&seq.bytes) {
                         let side = self.sidebar_rect;
                         if self.sidebar_width > 0
@@ -990,9 +1000,6 @@ impl App {
                 continue;
             }
             if is_sgr_mouse(&seq.bytes) {
-                if sgr_has_shift(&seq.bytes) {
-                    continue; // outer terminal selection
-                }
                 // Modal: ignore hit-test clicks (keys still handle modal).
                 if self.modal.is_some() {
                     continue;
@@ -1007,8 +1014,13 @@ impl App {
                     }
                     continue;
                 }
+                // Pane-clipped selection in Agent content (never spans sidebar).
+                if self.handle_pane_selection_sgr(&seq.bytes)? {
+                    continue;
+                }
                 // Nav: shell hit-test on button press only (B1). Left-click still attaches.
                 if sgr_is_button_press(&seq.bytes) {
+                    self.pane_sel = None;
                     if let Some((x, y)) = parse_sgr_xy(&seq.bytes) {
                         self.dispatch_shell_hit(x, y)?;
                     }
@@ -1062,8 +1074,17 @@ impl App {
         let sess = self.sess_list_rect;
         if point_in_rect(x, y, sess.x, sess.y, sess.width, sess.height) {
             if let Some(i) = list_row_index(y, sess.y, sess.height, self.session_list.len()) {
+                let now = Instant::now();
+                let dbl = self.last_session_click.is_some_and(|(t, idx)| {
+                    idx == i && now.duration_since(t) <= SESSION_DOUBLE_CLICK
+                });
                 self.selected_session = i;
                 self.clear_selected_unread();
+                if dbl {
+                    self.last_session_click = None;
+                    return self.attach_selected();
+                }
+                self.last_session_click = Some((now, i));
             }
             // else: past last session → chrome
             return Ok(());
@@ -2012,6 +2033,7 @@ impl App {
 
         if running {
             self.draw_live_pty(f, inner, &id);
+            self.paint_pane_sel_overlay(f);
             return;
         }
 
@@ -2064,6 +2086,22 @@ impl App {
         };
         self.ensure_transcript_cache(&path, summary.mtime, summary.size, summary.provider);
         self.draw_transcript_preview(f, body);
+        self.paint_pane_sel_overlay(f);
+    }
+
+    fn paint_pane_sel_overlay(&self, f: &mut Frame) {
+        let Some(sel) = self.pane_sel.as_ref() else {
+            return;
+        };
+        if !sel.dragged {
+            return;
+        }
+        // Solid selection chrome (same as sidebar highlight) — high contrast fill.
+        let style = Style::default()
+            .fg(self.theme.selection_fg)
+            .bg(self.theme.selection_bg)
+            .add_modifier(Modifier::BOLD);
+        paint_selection_overlay(f.buffer_mut(), sel, style);
     }
 
     fn draw_live_pty(&mut self, f: &mut Frame, inner: Rect, id: &str) {
@@ -2143,6 +2181,188 @@ impl App {
             blocks,
             scroll_from_bottom: 0,
         });
+    }
+
+    fn focused_child_wants_mouse(&self) -> bool {
+        self.focused_session_id
+            .as_ref()
+            .and_then(|id| self.sessions.get(id))
+            .map(|pty| {
+                let m = pty.mirrored_modes();
+                m.mouse_1000 || m.mouse_1002 || m.mouse_1003
+            })
+            .unwrap_or(false)
+    }
+
+    /// Host should own this left-button gesture (pane-clipped selection).
+    fn should_host_select(&self, seq: &[u8], child_wants_mouse: bool) -> bool {
+        if !sgr_is_left_button(seq) {
+            return false;
+        }
+        if self.focus == Focus::Nav {
+            return true;
+        }
+        if !child_wants_mouse {
+            return true;
+        }
+        // Child owns plain mouse — require Shift or Alt/Meta.
+        sgr_has_shift(seq) || sgr_has_meta(seq)
+    }
+
+    /// Content rect for selection (excludes exited banner row).
+    fn agent_content_rect(&self) -> Rect {
+        let inner = self.pty_area;
+        let Some(summary) = self.session_list.get(self.selected_session) else {
+            return inner;
+        };
+        let exited = self
+            .sessions
+            .get(&summary.id)
+            .is_some_and(|p| p.is_exited());
+        let live = self
+            .sessions
+            .get(&summary.id)
+            .is_some_and(|p| !p.is_exited());
+        if live || !exited || inner.height <= 1 {
+            return inner;
+        }
+        Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: inner.height - 1,
+        }
+    }
+
+    /// Handle SGR for pane selection. Returns true if the event was consumed.
+    fn handle_pane_selection_sgr(&mut self, seq: &[u8]) -> Result<bool> {
+        if !sgr_is_left_button(seq) {
+            return Ok(false);
+        }
+        let content = self.agent_content_rect();
+        if content.width == 0 || content.height == 0 {
+            return Ok(false);
+        }
+        let Some((x, y)) = parse_sgr_xy(seq) else {
+            return Ok(false);
+        };
+
+        if sgr_is_button_press(seq) {
+            if !point_in_rect(x, y, content.x, content.y, content.width, content.height) {
+                return Ok(false);
+            }
+            let (row, col) = self::selection::screen_to_local(content, x, y);
+            self.pane_sel = Some(PaneSelection::begin(content, row, col));
+            return Ok(true);
+        }
+
+        if let Some(sel) = self.pane_sel.as_mut() {
+            // Keep using the area captured at press (layout rarely changes mid-drag).
+            if sgr_is_motion(seq) || (!sgr_is_release(seq) && sel.dragged) {
+                // Clamp pointer into content even if it drifts over the sidebar.
+                let cx = x.clamp(sel.area.x, sel.area.x.saturating_add(sel.area.width.saturating_sub(1)));
+                let cy = y.clamp(sel.area.y, sel.area.y.saturating_add(sel.area.height.saturating_sub(1)));
+                sel.update_end(cx, cy);
+                return Ok(true);
+            }
+            if sgr_is_release(seq) {
+                let cx = x.clamp(
+                    sel.area.x,
+                    sel.area.x.saturating_add(sel.area.width.saturating_sub(1)),
+                );
+                let cy = y.clamp(
+                    sel.area.y,
+                    sel.area.y.saturating_add(sel.area.height.saturating_sub(1)),
+                );
+                sel.update_end(cx, cy);
+                let dragged = sel.dragged;
+                let anchor_screen = (
+                    sel.area.x.saturating_add(sel.anchor.1),
+                    sel.area.y.saturating_add(sel.anchor.0),
+                );
+                if dragged {
+                    self.finish_pane_selection()?;
+                } else {
+                    self.pane_sel = None;
+                    // Nav click-to-attach: press was consumed to arm selection;
+                    // a no-drag release still counts as a pane hit.
+                    if self.focus == Focus::Nav {
+                        self.dispatch_shell_hit(anchor_screen.0, anchor_screen.1)?;
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn finish_pane_selection(&mut self) -> Result<()> {
+        let Some(sel) = self.pane_sel.take() else {
+            return Ok(());
+        };
+        if !sel.dragged {
+            return Ok(());
+        }
+        let (a, b) = sel.normalized();
+        let text = self.extract_pane_selection_text(&sel, a, b);
+        if text.is_empty() {
+            self.status = "selection empty".into();
+            return Ok(());
+        }
+        let n = text.chars().count();
+        let seq = osc52_clipboard_set(&text);
+        io::stdout().write_all(&seq)?;
+        io::stdout().flush()?;
+        self.status = format!("copied {n} chars");
+        Ok(())
+    }
+
+    fn extract_pane_selection_text(
+        &self,
+        sel: &PaneSelection,
+        a: (u16, u16),
+        b: (u16, u16),
+    ) -> String {
+        let Some(summary) = self.session_list.get(self.selected_session) else {
+            return String::new();
+        };
+        let live = self
+            .sessions
+            .get(&summary.id)
+            .is_some_and(|p| !p.is_exited());
+        if live {
+            if let Some(pty) = self.sessions.get(&summary.id) {
+                return text_from_snapshot(&pty.snapshot(), a, b);
+            }
+            return String::new();
+        }
+        // Transcript preview: rebuild the same visible window as draw.
+        let Some(cache) = self.transcript_cache.as_ref() else {
+            return String::new();
+        };
+        let h = sel.area.height as usize;
+        let w = sel.area.width as usize;
+        if h == 0 || w == 0 {
+            return String::new();
+        }
+        let rendered = render_blocks(&cache.blocks, w, &self.theme);
+        let total = rendered.len();
+        let offset = cache.scroll_from_bottom.min(total.saturating_sub(h));
+        let end = total.saturating_sub(offset);
+        let start = end.saturating_sub(h);
+        let mut plain: Vec<String> = Vec::with_capacity(h);
+        for rl in rendered.iter().skip(start).take(h) {
+            let mut s = String::new();
+            for sp in &rl.spans {
+                s.push_str(&sp.text);
+            }
+            plain.push(s);
+        }
+        while plain.len() < h {
+            plain.insert(0, String::new());
+        }
+        let grid = grid_from_plain_lines(&plain, w);
+        self::selection::extract_from_grid(&grid, a, b)
     }
 
     /// Scroll Agent pane content without changing focus (Nav or Agent).
@@ -2523,6 +2743,8 @@ fn draw_help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
         ("j/k", "move session · K/J move workspace"),
         ("Enter", "attach / resume selected session"),
         ("click", "select workspace/session · Agent pane attaches"),
+        ("dbl-click", "session row → attach / resume (same as Enter)"),
+        ("drag", "select text in Agent pane (clipped; Alt/Shift if omp owns mouse)"),
         ("Esc", "close this help"),
     ] {
         lines.push(help_key_row(k, d));
@@ -2868,14 +3090,10 @@ fn draw_rename_dialog(
 ) {
     let title = " Rename session ";
     let prompt = "New name:";
-    let mut content_w = unicode_width::UnicodeWidthStr::width(title.trim()) as u16;
-    content_w = content_w.max(unicode_width::UnicodeWidthStr::width(prompt) as u16);
-    content_w = content_w.max(unicode_width::UnicodeWidthStr::width(input.text.as_str()) as u16 + 2);
-    if let Some(err) = error {
-        content_w = content_w.max(unicode_width::UnicodeWidthStr::width(err) as u16);
-    }
-    content_w = content_w.max(28);
-    let w = (content_w + 6).clamp(34, area.width.saturating_sub(4).max(34).min(58));
+    // Fixed dialog width — does not grow with input length.
+    let w = 48u16
+        .min(area.width.saturating_sub(4).max(36))
+        .max(36);
     let h = if error.is_some() { 9 } else { 8 }.min(area.height.saturating_sub(2).max(8));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
@@ -2925,43 +3143,50 @@ fn draw_rename_dialog(
         chunks[0],
     );
 
-    let cursor = input.cursor.min(input.text.len());
-    let (before, after) = input.text.split_at(cursor);
-    let mut spans = vec![
-        Span::styled(
-            " ",
-            Style::default().bg(theme.overlay_bg),
-        ),
-        Span::styled(
-            before.to_string(),
-            Style::default().fg(theme.text_fg).bg(theme.overlay_bg),
-        ),
-        Span::styled(
-            after.chars().next().map(|c| c.to_string()).unwrap_or_else(|| " ".into()),
-            Style::default()
-                .fg(theme.overlay_bg)
-                .bg(theme.text_fg)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if !after.is_empty() {
-        let rest: String = after.chars().skip(1).collect();
-        if !rest.is_empty() {
-            spans.push(Span::styled(
-                rest,
-                Style::default().fg(theme.text_fg).bg(theme.overlay_bg),
-            ));
+    // Fixed field: 1-col side pads + scrolled text viewport.
+    let field = chunks[1];
+    let pad = 1u16;
+    let view_cols = field.width.saturating_sub(pad * 2).max(1) as usize;
+    let view = input.view(view_cols);
+    let text_style = Style::default().fg(theme.text_fg).bg(theme.overlay_bg);
+    let caret_style = Style::default()
+        .fg(theme.overlay_bg)
+        .bg(theme.text_fg)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::styled(" ".repeat(pad as usize), text_style)];
+    let mut col = 0usize;
+    let mut caret_drawn = false;
+    for ch in view.visible.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        if !caret_drawn && col == view.cursor_col {
+            spans.push(Span::styled(ch.to_string(), caret_style));
+            caret_drawn = true;
+        } else {
+            spans.push(Span::styled(ch.to_string(), text_style));
         }
+        col += cw;
     }
+    if !caret_drawn {
+        // Cursor at/after end of visible text.
+        spans.push(Span::styled(" ", caret_style));
+        col += 1;
+    }
+    let fill = view_cols.saturating_sub(col);
+    if fill > 0 {
+        spans.push(Span::styled(" ".repeat(fill), text_style));
+    }
+    spans.push(Span::styled(" ".repeat(pad as usize), text_style));
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.overlay_bg)),
-        chunks[1],
+        field,
     );
 
     if let Some(err) = error {
+        let err_w = field.width.saturating_sub(2).max(1) as usize;
+        let shown = truncate_to_width(err, err_w);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                err.to_string(),
+                shown,
                 Style::default()
                     .fg(theme.error)
                     .bg(theme.overlay_bg),
@@ -3181,7 +3406,7 @@ fn rendered_line_to_ratatui(t: &Theme, rl: &RenderedLine, width: u16) -> Line<'s
             SpanStyle::Normal => {}
             SpanStyle::Bold => style = style.add_modifier(Modifier::BOLD),
             SpanStyle::Italic => style = style.add_modifier(Modifier::ITALIC),
-            SpanStyle::Code => style = style.fg(t.md_code),
+            SpanStyle::Code => style = style.fg(t.md_code).bg(t.md_code_bg),
             SpanStyle::Heading => style = style.fg(t.md_heading).add_modifier(Modifier::BOLD),
             SpanStyle::Link => style = style.fg(t.md_link).add_modifier(Modifier::UNDERLINED),
             SpanStyle::Dim => style = style.fg(t.dim),

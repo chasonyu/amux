@@ -62,8 +62,9 @@ pub fn translate_sgr_mouse_clipped(
     Some(format!("\x1b[<{cb};{tx};{ty}{}", final_byte as char).into_bytes())
 }
 
-/// Whether Shift is held in an SGR mouse report (bit 2 of Cb) — yield to outer
-/// terminal selection; do not forward.
+/// Whether Shift is held in an SGR mouse report (bit 2 of Cb).
+/// Used with Alt/Meta to request host pane-clipped selection while the child
+/// owns plain mouse.
 pub fn sgr_has_shift(seq: &[u8]) -> bool {
     if !is_sgr_mouse(seq) {
         return false;

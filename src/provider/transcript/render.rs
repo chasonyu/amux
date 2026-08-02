@@ -156,8 +156,9 @@ fn render_one(block: &TranscriptBlock, width: usize, out: &mut Vec<RenderedLine>
             }
         }
         TranscriptBlock::Assistant { text } => {
-            let md_width = width.saturating_sub(1).max(1);
-            let md_lines = render_markdown(text, md_width);
+            // Full pane width (no left pad) so table borders can use the same
+            // column budget the preview actually paints into.
+            let md_lines = render_markdown(text, width);
             out.extend(RenderedLine::from_md(TranscriptRole::Assistant, md_lines, false));
         }
         TranscriptBlock::Thinking { summary } => {

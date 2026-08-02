@@ -2,8 +2,9 @@
 //!
 //! Renders a subset aligned with omp's default collapsed look: ATX headings,
 //! ordered/unordered lists, fenced code (lang preserved), blockquotes, hr,
-//! and inline `**bold**` / `*italic*` / `` `code` `` / `[text](url)` styled as
-//! spans rather than stripped to plain text.
+//! GFM tables (box borders + width-adaptive columns, ported from omp
+//! `#renderTable`), and inline `**bold**` / `*italic*` / `` `code` `` /
+//! `[text](url)` styled as spans rather than stripped to plain text.
 
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
@@ -107,18 +108,13 @@ pub fn render_markdown(src: &str, width: usize) -> Vec<MdLine> {
         if let Some(inner) = parse_blockquote(trimmed) {
             let inner_w = width.saturating_sub(2).max(1);
             for w in wrap_text(&inner, inner_w) {
-                out.push(MdLine {
-                    spans: vec![
-                        MdSpan {
-                            text: "│ ".into(),
-                            kind: MdKind::Dim,
-                        },
-                        MdSpan {
-                            text: w,
-                            kind: MdKind::Italic,
-                        },
-                    ],
-                });
+                let mut spans = vec![MdSpan {
+                    text: "│ ".into(),
+                    kind: MdKind::Dim,
+                }];
+                // Keep quote italic as base; still strip ** / ` inside.
+                spans.extend(parse_inline(&w, MdKind::Italic));
+                out.push(MdLine { spans });
             }
             continue;
         }
@@ -128,35 +124,13 @@ pub fn render_markdown(src: &str, width: usize) -> Vec<MdLine> {
             let marker = format!("{num}. ");
             let mw = marker.width();
             let inner_w = width.saturating_sub(mw).max(1);
-            for (i, w) in wrap_text(&text, inner_w).into_iter().enumerate() {
-                if i == 0 {
-                    out.push(MdLine {
-                        spans: vec![
-                            MdSpan {
-                                text: marker.clone(),
-                                kind: MdKind::ListBullet,
-                            },
-                            MdSpan {
-                                text: w,
-                                kind: MdKind::Normal,
-                            },
-                        ],
-                    });
-                } else {
-                    out.push(MdLine {
-                        spans: vec![
-                            MdSpan {
-                                text: " ".repeat(mw),
-                                kind: MdKind::Normal,
-                            },
-                            MdSpan {
-                                text: w,
-                                kind: MdKind::Normal,
-                            },
-                        ],
-                    });
-                }
-            }
+            out.extend(render_prefix_lines(
+                &marker,
+                MdKind::ListBullet,
+                &text,
+                inner_w,
+                mw,
+            ));
             continue;
         }
 
@@ -165,36 +139,35 @@ pub fn render_markdown(src: &str, width: usize) -> Vec<MdLine> {
             let marker = "• ";
             let mw = marker.width();
             let inner_w = width.saturating_sub(mw).max(1);
-            for (i, w) in wrap_text(&text, inner_w).into_iter().enumerate() {
-                if i == 0 {
-                    out.push(MdLine {
-                        spans: vec![
-                            MdSpan {
-                                text: marker.into(),
-                                kind: MdKind::ListBullet,
-                            },
-                            MdSpan {
-                                text: w,
-                                kind: MdKind::Normal,
-                            },
-                        ],
-                    });
-                } else {
-                    out.push(MdLine {
-                        spans: vec![
-                            MdSpan {
-                                text: " ".repeat(mw),
-                                kind: MdKind::Normal,
-                            },
-                            MdSpan {
-                                text: w,
-                                kind: MdKind::Normal,
-                            },
-                        ],
-                    });
+            out.extend(render_prefix_lines(
+                marker,
+                MdKind::ListBullet,
+                &text,
+                inner_w,
+                mw,
+            ));
+            continue;
+        }
+
+        // GFM table: header + |---| separator + body rows (omp `#renderTable`).
+        if looks_like_table_row(trimmed) {
+            if let Some(sep) = lines.peek().copied() {
+                if is_table_separator(sep.trim_end()) {
+                    lines.next(); // consume separator
+                    let header = split_table_row(trimmed);
+                    let mut rows = Vec::new();
+                    while let Some(next) = lines.peek().copied() {
+                        let nt = next.trim_end();
+                        if nt.is_empty() || !looks_like_table_row(nt) || is_table_separator(nt) {
+                            break;
+                        }
+                        rows.push(split_table_row(nt));
+                        lines.next();
+                    }
+                    out.extend(render_table(&header, &rows, width));
+                    continue;
                 }
             }
-            continue;
         }
 
         // Blank line
@@ -214,8 +187,401 @@ pub fn render_markdown(src: &str, width: usize) -> Vec<MdLine> {
     out
 }
 
+// ── GFM table (omp-aligned) ─────────────────────────────────────────────
+
+const TABLE_MAX_WORD: usize = 30;
+
+fn looks_like_table_row(line: &str) -> bool {
+    let t = line.trim();
+    t.contains('|') && !is_table_separator(t)
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let cells = split_table_row(line);
+    if cells.is_empty() {
+        return false;
+    }
+    cells.iter().all(|c| {
+        let mut t = c.trim();
+        if t.is_empty() {
+            return false;
+        }
+        if let Some(rest) = t.strip_prefix(':') {
+            t = rest;
+        }
+        if let Some(rest) = t.strip_suffix(':') {
+            t = rest;
+        }
+        let dashes = t.chars().filter(|&ch| ch == '-').count();
+        dashes >= 3 && t.chars().all(|ch| ch == '-')
+    })
+}
+
+fn split_table_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|')
+        .map(|c| c.trim().to_string())
+        .collect()
+}
+
+fn pad_visible(text: &str, width: usize) -> String {
+    let w = UnicodeWidthStr::width(text);
+    if w >= width {
+        text.to_string()
+    } else {
+        format!("{text}{}", " ".repeat(width - w))
+    }
+}
+
+fn longest_word_width(text: &str, cap: usize) -> usize {
+    let mut max = 1usize;
+    let mut any_word = false;
+    for word in text.split_whitespace() {
+        any_word = true;
+        max = max.max(UnicodeWidthStr::width(word).min(cap));
+    }
+    // No whitespace (e.g. CJK runs): treat whole cell as one word, capped.
+    if !any_word && !text.is_empty() {
+        max = UnicodeWidthStr::width(text).min(cap).max(1);
+    }
+    max.max(1).min(cap)
+}
+
+/// Allocate column widths like omp `#renderTable` (natural → min-word → shrink).
+fn allocate_column_widths(header: &[String], rows: &[Vec<String>], available_width: usize) -> Option<Vec<usize>> {
+    let num_cols = header.len();
+    if num_cols == 0 {
+        return None;
+    }
+    // "│ " + (n-1)*" │ " + " │" = 3n + 1
+    let border_overhead = 3 * num_cols + 1;
+    let available_for_cells = available_width.saturating_sub(border_overhead);
+    if available_for_cells < num_cols {
+        return None;
+    }
+
+    let mut natural = vec![0usize; num_cols];
+    let mut min_word = vec![1usize; num_cols];
+
+    let measure = |cells: &[String], natural: &mut [usize], min_word: &mut [usize]| {
+        for (i, cell) in cells.iter().enumerate().take(num_cols) {
+            let w = UnicodeWidthStr::width(cell.as_str());
+            natural[i] = natural[i].max(w);
+            min_word[i] = min_word[i].max(longest_word_width(cell, TABLE_MAX_WORD));
+        }
+    };
+    measure(header, &mut natural, &mut min_word);
+    for row in rows {
+        measure(row, &mut natural, &mut min_word);
+    }
+
+    let mut min_cols = min_word.clone();
+    let mut min_cells: usize = min_cols.iter().sum();
+
+    if min_cells > available_for_cells {
+        min_cols = vec![1; num_cols];
+        let remaining = available_for_cells.saturating_sub(num_cols);
+        if remaining > 0 {
+            let total_weight: usize = min_word.iter().map(|w| w.saturating_sub(1)).sum();
+            let mut growth = vec![0usize; num_cols];
+            for i in 0..num_cols {
+                let weight = min_word[i].saturating_sub(1);
+                growth[i] = if total_weight > 0 {
+                    (weight * remaining) / total_weight
+                } else {
+                    0
+                };
+                min_cols[i] += growth[i];
+            }
+            let allocated: usize = growth.iter().sum();
+            let mut leftover = remaining.saturating_sub(allocated);
+            let mut i = 0;
+            while leftover > 0 && i < num_cols {
+                min_cols[i] += 1;
+                leftover -= 1;
+                i += 1;
+            }
+        }
+        min_cells = min_cols.iter().sum();
+    }
+
+    let total_natural: usize = natural.iter().sum::<usize>() + border_overhead;
+    let column_widths = if total_natural <= available_width {
+        natural
+            .iter()
+            .zip(min_cols.iter())
+            .map(|(n, m)| (*n).max(*m))
+            .collect()
+    } else {
+        let total_grow: usize = natural
+            .iter()
+            .zip(min_cols.iter())
+            .map(|(n, m)| n.saturating_sub(*m))
+            .sum();
+        let extra = available_for_cells.saturating_sub(min_cells);
+        let mut widths: Vec<usize> = min_cols
+            .iter()
+            .enumerate()
+            .map(|(i, min_w)| {
+                let delta = natural[i].saturating_sub(*min_w);
+                let grow = if total_grow > 0 {
+                    (delta * extra) / total_grow
+                } else {
+                    0
+                };
+                min_w + grow
+            })
+            .collect();
+        let allocated: usize = widths.iter().sum();
+        let mut remaining = available_for_cells.saturating_sub(allocated);
+        while remaining > 0 {
+            let mut grew = false;
+            for i in 0..num_cols {
+                if remaining == 0 {
+                    break;
+                }
+                if widths[i] < natural[i] {
+                    widths[i] += 1;
+                    remaining -= 1;
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        widths
+    };
+    Some(column_widths)
+}
+
+fn normalize_table(header: &[String], rows: &[Vec<String>]) -> (Vec<String>, Vec<Vec<String>>) {
+    let n = header.len().max(
+        rows.iter()
+            .map(|r| r.len())
+            .max()
+            .unwrap_or(0),
+    ).max(1);
+    let pad = |cells: &[String]| -> Vec<String> {
+        let mut v = cells.to_vec();
+        while v.len() < n {
+            v.push(String::new());
+        }
+        if v.len() > n {
+            v.truncate(n);
+        }
+        v
+    };
+    (pad(header), rows.iter().map(|r| pad(r)).collect())
+}
+
+/// Strip inline markdown markers so measure/wrap/pad use the same visible text
+/// that will be painted (avoids column drift / "ghost" │ inside cells).
+fn cell_to_plain(raw: &str) -> String {
+    parse_inline(raw, MdKind::Normal)
+        .into_iter()
+        .map(|s| s.text)
+        .collect()
+}
+
+/// Fit `text` into exactly `width` display columns (truncate + pad).
+fn fit_cell(text: &str, width: usize) -> String {
+    let width = width.max(1);
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in text.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if w + cw > width {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    pad_visible(&out, width)
+}
+
+fn push_table_data_line(out: &mut Vec<MdLine>, cells: &[String], kind: MdKind, col_widths: &[usize]) {
+    let v = '│';
+    let mut spans = vec![MdSpan {
+        text: format!("{v} "),
+        kind: MdKind::Dim,
+    }];
+    for (ci, text) in cells.iter().enumerate() {
+        spans.push(MdSpan {
+            text: fit_cell(text, col_widths[ci]),
+            kind,
+        });
+        if ci + 1 < col_widths.len() {
+            spans.push(MdSpan {
+                text: format!(" {v} "),
+                kind: MdKind::Dim,
+            });
+        }
+    }
+    spans.push(MdSpan {
+        text: format!(" {v}"),
+        kind: MdKind::Dim,
+    });
+    out.push(MdLine { spans });
+}
+
+fn render_table(header: &[String], rows: &[Vec<String>], width: usize) -> Vec<MdLine> {
+    let width = width.max(1);
+    let (header, rows) = normalize_table(header, rows);
+    // omp measures after inline render — do the same before layout.
+    let header: Vec<String> = header.iter().map(|c| cell_to_plain(c)).collect();
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|c| cell_to_plain(c)).collect())
+        .collect();
+
+    let Some(col_widths) = allocate_column_widths(&header, &rows, width) else {
+        // Too narrow: fall back to raw pipes (wrapped), like omp.
+        let mut raw = String::new();
+        raw.push_str(&format!("| {} |\n", header.join(" | ")));
+        raw.push_str(&format!(
+            "| {} |\n",
+            header
+                .iter()
+                .map(|_| "---")
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+        for row in &rows {
+            raw.push_str(&format!("| {} |\n", row.join(" | ")));
+        }
+        return wrap_text(raw.trim_end(), width)
+            .into_iter()
+            .map(|w| MdLine::plain(w, MdKind::Dim))
+            .collect();
+    };
+
+    let h = '─';
+    let mut out = Vec::new();
+
+    let border_line = |left: char, mid: char, right: char| -> String {
+        let mut s = String::new();
+        s.push(left);
+        for (i, w) in col_widths.iter().enumerate() {
+            s.push(h);
+            s.push_str(&h.to_string().repeat(*w));
+            s.push(h);
+            if i + 1 < col_widths.len() {
+                s.push(mid);
+            }
+        }
+        s.push(right);
+        s
+    };
+
+    out.push(MdLine::plain(border_line('┌', '┬', '┐'), MdKind::Dim));
+
+    let header_wrapped: Vec<Vec<String>> = header
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| wrap_text(cell, col_widths[i].max(1)))
+        .collect();
+    let header_lines = header_wrapped.iter().map(|c| c.len()).max().unwrap_or(1);
+    for li in 0..header_lines {
+        let cells: Vec<String> = header_wrapped
+            .iter()
+            .map(|c| c.get(li).cloned().unwrap_or_default())
+            .collect();
+        push_table_data_line(&mut out, &cells, MdKind::Bold, &col_widths);
+    }
+
+    let sep = border_line('├', '┼', '┤');
+    out.push(MdLine::plain(sep.clone(), MdKind::Dim));
+
+    for (ri, row) in rows.iter().enumerate() {
+        let wrapped: Vec<Vec<String>> = row
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| wrap_text(cell, col_widths[i].max(1)))
+            .collect();
+        let nlines = wrapped.iter().map(|c| c.len()).max().unwrap_or(1);
+        for li in 0..nlines {
+            let cells: Vec<String> = wrapped
+                .iter()
+                .map(|c| c.get(li).cloned().unwrap_or_default())
+                .collect();
+            push_table_data_line(&mut out, &cells, MdKind::Normal, &col_widths);
+        }
+        if ri + 1 < rows.len() {
+            out.push(MdLine::plain(sep.clone(), MdKind::Dim));
+        }
+    }
+
+    out.push(MdLine::plain(border_line('└', '┴', '┘'), MdKind::Dim));
+    out.push(MdLine::empty());
+
+    // Defensive: every structural line must share the same visible width.
+    debug_assert!({
+        let widths: Vec<usize> = out
+            .iter()
+            .filter(|l| {
+                let t: String = l.spans.iter().map(|s| s.text.as_str()).collect();
+                t.contains('│') || t.contains('┌') || t.contains('└') || t.contains('├')
+            })
+            .map(|l| {
+                let t: String = l.spans.iter().map(|s| s.text.as_str()).collect();
+                UnicodeWidthStr::width(t.as_str())
+            })
+            .collect();
+        widths.windows(2).all(|w| w[0] == w[1])
+    });
+
+    out
+}
+
+/// Prefixed block (list item): marker on first wrapped line, indent after;
+/// body runs through [`parse_inline`] so `**` / `*` markers are not painted.
+fn render_prefix_lines(
+    marker: &str,
+    marker_kind: MdKind,
+    text: &str,
+    inner_w: usize,
+    indent_w: usize,
+) -> Vec<MdLine> {
+    let mut out = Vec::new();
+    for (i, w) in wrap_text(text, inner_w).into_iter().enumerate() {
+        let mut spans = Vec::new();
+        if i == 0 {
+            spans.push(MdSpan {
+                text: marker.to_string(),
+                kind: marker_kind,
+            });
+        } else {
+            spans.push(MdSpan {
+                text: " ".repeat(indent_w),
+                kind: MdKind::Normal,
+            });
+        }
+        spans.extend(parse_inline(&w, MdKind::Normal));
+        out.push(MdLine { spans });
+    }
+    out
+}
+
+/// Combine outer style `base` with an inner matched `kind`.
+fn elevate(base: MdKind, kind: MdKind) -> MdKind {
+    match kind {
+        // Semantic colors win over bold/italic wrapper.
+        MdKind::Code | MdKind::Link | MdKind::Heading | MdKind::CodeBlock => kind,
+        MdKind::Normal => base,
+        MdKind::Bold | MdKind::Italic => match base {
+            MdKind::Bold | MdKind::Italic => MdKind::Bold,
+            _ => kind,
+        },
+        other => other,
+    }
+}
+
 /// Parse inline markers (`**bold**`, `*italic*`, `` `code` ``, `[text](url)`)
-/// into styled spans; non-marker text uses `base`.
+/// into styled spans; non-marker text uses `base`. Bold/italic recurse so
+/// nested `` `code` `` is highlighted and backticks are stripped.
 fn parse_inline(text: &str, base: MdKind) -> Vec<MdSpan> {
     let mut spans = Vec::new();
     let mut buf = String::new();
@@ -228,10 +594,23 @@ fn parse_inline(text: &str, base: MdKind) -> Vec<MdSpan> {
                     kind: base,
                 });
             }
-            spans.push(MdSpan {
-                text: content,
-                kind,
-            });
+            match kind {
+                MdKind::Bold | MdKind::Italic => {
+                    let nested_base = elevate(base, kind);
+                    for s in parse_inline(&content, nested_base) {
+                        spans.push(MdSpan {
+                            text: s.text,
+                            kind: elevate(base, s.kind),
+                        });
+                    }
+                }
+                other => {
+                    spans.push(MdSpan {
+                        text: content,
+                        kind: elevate(base, other),
+                    });
+                }
+            }
             rest = &rest[consumed..];
         } else {
             let ch = rest.chars().next().unwrap();
@@ -257,22 +636,48 @@ fn parse_inline(text: &str, base: MdKind) -> Vec<MdSpan> {
 /// Try to match an inline marker at the start of `rest`.
 /// Returns (content, kind, consumed bytes) or None.
 fn match_inline(rest: &str) -> Option<(String, MdKind, usize)> {
-    // **bold**
-    if rest.starts_with("**") {
-        if let Some(end) = rest[2..].find("**") {
-            return Some((rest[2..2 + end].to_string(), MdKind::Bold, 2 + end + 2));
-        }
-    }
-    // `code`
+    // `code` before emphasis so `` `**x**` `` stays code.
     if rest.starts_with('`') {
         if let Some(end) = rest[1..].find('`') {
             return Some((rest[1..1 + end].to_string(), MdKind::Code, 1 + end + 1));
         }
     }
-    // *italic* (single star, not **)
+    // **bold** / __bold__
+    if rest.starts_with("**") {
+        if let Some(end) = rest[2..].find("**") {
+            return Some((rest[2..2 + end].to_string(), MdKind::Bold, 2 + end + 2));
+        }
+    }
+    if rest.starts_with("__") {
+        if let Some(end) = rest[2..].find("__") {
+            return Some((rest[2..2 + end].to_string(), MdKind::Bold, 2 + end + 2));
+        }
+    }
+    // *italic* (single star, not **). GFM-ish: opening * cannot be followed by
+    // whitespace (so `* **bold**` / list-like stars are not eaten as italic).
     if rest.starts_with('*') && !rest.starts_with("**") {
-        if let Some(end) = rest[1..].find('*') {
-            return Some((rest[1..1 + end].to_string(), MdKind::Italic, 1 + end + 1));
+        let after = &rest[1..];
+        if after
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace())
+        {
+            if let Some(end) = find_single_delim(after, '*') {
+                return Some((after[..end].to_string(), MdKind::Italic, 1 + end + 1));
+            }
+        }
+    }
+    // _italic_ (not part of __)
+    if rest.starts_with('_') && !rest.starts_with("__") {
+        let after = &rest[1..];
+        if after
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace())
+        {
+            if let Some(end) = find_single_delim(after, '_') {
+                return Some((after[..end].to_string(), MdKind::Italic, 1 + end + 1));
+            }
         }
     }
     // [text](url)
@@ -286,6 +691,37 @@ fn match_inline(rest: &str) -> Option<(String, MdKind, usize)> {
                 ));
             }
         }
+    }
+    None
+}
+
+/// Index of a single-character closer that is not part of a double delimiter
+/// (`**` / `__`).
+fn find_single_delim(after: &str, delim: char) -> Option<usize> {
+    let mut i = 0;
+    while i < after.len() {
+        if after[i..].starts_with(delim) {
+            // Skip `**` / `__` pairs so italic closer isn't the first half of bold.
+            if delim == '*' && after[i..].starts_with("**") {
+                i += 2;
+                continue;
+            }
+            if delim == '_' && after[i..].starts_with("__") {
+                i += 2;
+                continue;
+            }
+            // Closing delimiter must not be preceded by whitespace (GFM-ish).
+            if i > 0 {
+                let prev = after[..i].chars().last();
+                if prev.is_some_and(|c| c.is_whitespace()) {
+                    i += delim.len_utf8();
+                    continue;
+                }
+            }
+            return Some(i);
+        }
+        let ch = after[i..].chars().next()?;
+        i += ch.len_utf8();
     }
     None
 }
@@ -442,6 +878,23 @@ mod tests {
     }
 
     #[test]
+    fn nested_code_inside_bold_strips_backticks() {
+        let lines = render_markdown("1. **`.cursor/worktrees.json` 自动 setup**", 80);
+        let t = plain_text(&lines[0]);
+        assert!(t.contains(".cursor/worktrees.json"), "{t}");
+        assert!(!t.contains('`'), "backticks leaked: {t}");
+        assert!(!t.contains('*'), "stars leaked: {t}");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| s.kind == MdKind::Code && s.text.contains("worktrees")),
+            "{:?}",
+            lines[0].spans
+        );
+    }
+
+    #[test]
     fn italic_single_star() {
         let lines = render_markdown("a *b* c", 80);
         let spans = &lines[0].spans;
@@ -495,6 +948,47 @@ mod tests {
     }
 
     #[test]
+    fn list_item_strips_bold_markers() {
+        let lines = render_markdown("* **Cursor 路线**: 说明", 80);
+        let t = plain_text(&lines[0]);
+        assert!(t.starts_with('•'), "{t}");
+        assert!(t.contains("Cursor 路线"), "{t}");
+        assert!(!t.contains('*'), "markers leaked: {t}");
+        assert!(
+            lines[0].spans.iter().any(|s| s.kind == MdKind::Bold && s.text.contains("Cursor")),
+            "{:?}",
+            lines[0].spans
+        );
+    }
+
+    #[test]
+    fn ordered_list_strips_bold_markers() {
+        let lines = render_markdown("1. **自动清理 + 限额** — 说明", 80);
+        let t = plain_text(&lines[0]);
+        assert!(t.starts_with("1. "), "{t}");
+        assert!(t.contains("自动清理"), "{t}");
+        assert!(!t.contains('*'), "markers leaked: {t}");
+    }
+
+    #[test]
+    fn star_space_bold_not_eaten_as_italic() {
+        // Paragraph form: leading "* **" must not become italic-of-space.
+        let lines = render_markdown("see * **Bold** ok", 80);
+        let t = plain_text(&lines[0]);
+        assert!(t.contains("Bold"), "{t}");
+        assert!(!t.contains("**"), "{t}");
+        // Leading list-like star before bold stays a literal '*'.
+        assert!(t.contains("* Bold") || t.contains("*Bold") || t.contains("see *"), "{t}");
+    }
+
+    #[test]
+    fn star_count_not_italic() {
+        let lines = render_markdown("agent-deck (Go, 643*, fleet)", 80);
+        let t = plain_text(&lines[0]);
+        assert!(t.contains("643*"), "{t}");
+    }
+
+    #[test]
     fn blockquote_border_and_italic() {
         let lines = render_markdown("> quoted", 80);
         assert_eq!(lines[0].spans[0].text, "│ ");
@@ -514,5 +1008,92 @@ mod tests {
     fn long_word_wraps_by_char() {
         let lines = render_markdown("aaaaaaaaaaaaaaaaaaaa", 5);
         assert!(lines.iter().all(|l| plain_text(l).chars().count() <= 5));
+    }
+
+    #[test]
+    fn gfm_table_renders_box_borders() {
+        let src = "\
+| 维度 | Cursor | dux |
+| --- | --- | --- |
+| A | yes | no |
+| B | ✅ | ❌ |
+";
+        let lines = render_markdown(src, 80);
+        let joined: String = lines.iter().map(plain_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains('┌'), "top border: {joined}");
+        assert!(joined.contains('└'), "bottom border: {joined}");
+        assert!(joined.contains('┼') || joined.contains('├'), "separator: {joined}");
+        assert!(joined.contains("维度"), "{joined}");
+        assert!(joined.contains("Cursor"), "{joined}");
+        // Must not leave raw markdown separator visible as primary render.
+        assert!(!joined.contains("| --- |"), "{joined}");
+    }
+
+    #[test]
+    fn gfm_table_columns_align_with_cjk() {
+        let src = "\
+| 维度 | Cursor | dux |
+| --- | --- | --- |
+| worktree 定位 | 隔离执行 | git 舞台 |
+";
+        let lines = render_markdown(src, 60);
+        // Every border/data line that contains │ should share the same visible width.
+        let widths: Vec<usize> = lines
+            .iter()
+            .map(plain_text)
+            .filter(|s| s.contains('│') || s.contains('┌') || s.contains('└') || s.contains('├'))
+            .map(|s| UnicodeWidthStr::width(s.as_str()))
+            .collect();
+        assert!(!widths.is_empty());
+        let first = widths[0];
+        assert!(
+            widths.iter().all(|&w| w == first),
+            "mismatched table line widths: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn gfm_table_inline_markers_do_not_shift_columns() {
+        // Markers must be stripped before measure/pad, otherwise │ drifts.
+        let src = "\
+| A | B |
+| --- | --- |
+| `code` x | **bold** y |
+| plain | plain |
+";
+        let lines = render_markdown(src, 40);
+        let widths: Vec<usize> = lines
+            .iter()
+            .map(plain_text)
+            .filter(|s| s.contains('│') || s.contains('┌'))
+            .map(|s| UnicodeWidthStr::width(s.as_str()))
+            .collect();
+        let first = widths[0];
+        assert!(
+            widths.iter().all(|&w| w == first),
+            "marker-induced drift: {widths:?}\n{}",
+            lines.iter().map(plain_text).collect::<Vec<_>>().join("\n")
+        );
+        let joined = lines.iter().map(plain_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("code"), "{joined}");
+        assert!(!joined.contains('`'), "{joined}");
+    }
+
+    #[test]
+    fn gfm_table_adapts_to_narrow_width() {
+        let src = "\
+| 维度 | Cursor | dux |
+| --- | --- | --- |
+| 多模型竞速 | ✅ /best-of-n 同任务多模型各一 worktree | ❌ 无竞速概念 |
+";
+        let wide = render_markdown(src, 100);
+        let narrow = render_markdown(src, 40);
+        let wide_s: String = wide.iter().map(plain_text).collect::<Vec<_>>().join("\n");
+        let narrow_s: String = narrow.iter().map(plain_text).collect::<Vec<_>>().join("\n");
+        // Narrow render should still be bounded and include content.
+        assert!(narrow.iter().all(|l| UnicodeWidthStr::width(plain_text(l).as_str()) <= 40));
+        assert!(narrow_s.contains("多模型") || narrow_s.contains("竞速") || narrow_s.contains('|'));
+        // Wide prefers boxed form when it fits.
+        assert!(wide_s.contains('┌') || wide_s.contains('│'));
     }
 }
