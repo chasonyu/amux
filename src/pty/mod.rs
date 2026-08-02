@@ -706,18 +706,14 @@ impl TerminalState {
                     symbol.push(*ch);
                 }
             }
+            // Do not forward BOLD / ITALIC / REVERSED to the outer terminal.
+            // amux re-paints nested PTY cells through ratatui; under tmux those
+            // SGR attrs (esp. italic on omp blockquotes) show up as solid gray
+            // bars (fg/bg swap look), while direct tmux+omp does not. Emphasis
+            // already lives in the cell's RGB/indexed colors — keep those.
             let mut modifier = Modifier::empty();
-            if cell.flags.contains(Flags::BOLD) {
-                modifier |= Modifier::BOLD;
-            }
-            if cell.flags.contains(Flags::ITALIC) {
-                modifier |= Modifier::ITALIC;
-            }
             if cell.flags.intersects(Flags::ALL_UNDERLINES) {
                 modifier |= Modifier::UNDERLINED;
-            }
-            if cell.flags.contains(Flags::INVERSE) {
-                modifier |= Modifier::REVERSED;
             }
             if cell.flags.contains(Flags::DIM) {
                 modifier |= Modifier::DIM;
@@ -1066,8 +1062,11 @@ fn convert_color(
             Color::Indexed(index)
         }
         TermColor::Named(named) => {
-            // Dynamic FG/BG: always the host surface RGB (same as OSC 10/11),
-            // never Reset — Reset vs Spec pageBg was the dual-palette clash.
+            // Dynamic FG/BG: FG stays surface RGB (matches OSC 10); BG paints as
+            // Reset so the outer terminal's transparency / host shade shows —
+            // same as omp's `\x1b[49m` default. OSC 11 replies still use
+            // `resolve_color_request_rgb` → surface.bg (see tests), so nested
+            // omp keeps a correct light/dark signal without a solid page wash.
             if is_dynamic_named(named) {
                 return named_color_to_tui(named, surface);
             }
@@ -1091,7 +1090,6 @@ fn is_dynamic_named(color: NamedColor) -> bool {
 
 fn named_color_to_tui(color: NamedColor, surface: HostSurface) -> Color {
     let (fr, fg, fb) = surface.fg;
-    let (br, bg, bb) = surface.bg;
     match color {
         NamedColor::Black => Color::Indexed(0),
         NamedColor::Red => Color::Indexed(1),
@@ -1117,11 +1115,14 @@ fn named_color_to_tui(color: NamedColor, surface: HostSurface) -> Color {
         NamedColor::DimMagenta => Color::Indexed(5),
         NamedColor::DimCyan => Color::Indexed(6),
         NamedColor::DimWhite => Color::Indexed(7),
-        // Same RGB we advertise via OSC 10/11 — keeps omp defaults aligned.
+        // FG: concrete surface RGB (aligned with OSC 10 answers).
         NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::Cursor => {
             Color::Rgb(fr, fg, fb)
         }
-        NamedColor::Background => Color::Rgb(br, bg, bb),
+        // BG: Reset leaks host (transparency). Do not paint surface.bg RGB here —
+        // that made nested omp a solid card vs direct-tmux glass. OSC 11 still
+        // reports `surface.bg` via `resolve_color_request_rgb` / `default_palette_rgb`.
+        NamedColor::Background => Color::Reset,
         NamedColor::DimForeground => Color::Rgb(0x80, 0x80, 0x80),
     }
 }
@@ -1166,6 +1167,37 @@ mod tests {
     fn smoke_echo_pty() {
         smoke_spawn_echo().expect("echo pty smoke");
     }
+
+    #[test]
+    fn snapshot_drops_bold_italic_reversed_keeps_underline() {
+        let mut term = TerminalState::new(5, 40, false, light_surface());
+        // bold + italic + underline + inverse + mediumGray (omp quote-like)
+        let (_replies, _) = term.process(
+            b"\x1b[1;3;4;7m\x1b[38;2;108;108;108mQUOTE\x1b[0m\n",
+        );
+        let snap = term.snapshot();
+        let cells: Vec<_> = snap
+            .cells
+            .iter()
+            .filter(|c| matches!(c.symbol.as_str(), "Q" | "U" | "O" | "T" | "E"))
+            .collect();
+        assert!(!cells.is_empty(), "expected QUOTE cells");
+        for c in cells {
+            assert!(
+                !c.modifier
+                    .intersects(Modifier::BOLD | Modifier::ITALIC | Modifier::REVERSED),
+                "attr must not be forwarded: {:?}",
+                c.modifier
+            );
+            assert!(
+                c.modifier.contains(Modifier::UNDERLINED),
+                "underline should still forward: {:?}",
+                c.modifier
+            );
+            assert_eq!(c.fg, Color::Rgb(108, 108, 108));
+        }
+    }
+
 
     #[test]
     fn color_query_fallback_uses_host_surface() {
@@ -1227,16 +1259,17 @@ mod tests {
     }
 
     #[test]
-    fn convert_named_uses_host_surface_rgb() {
+    fn convert_named_background_resets_to_leak_host_transparency() {
         let empty = alacritty_terminal::term::color::Colors::default();
         let host = HostSurface::from_bg(0x1e, 0x1e, 0x2e);
         assert_eq!(
             convert_color(TermColor::Named(NamedColor::Red), &empty, host),
             Color::Indexed(1)
         );
+        // Paint path: default bg must be Reset so outer terminal transparency shows.
         assert_eq!(
             convert_color(TermColor::Named(NamedColor::Background), &empty, host),
-            Color::Rgb(0x1e, 0x1e, 0x2e)
+            Color::Reset
         );
         assert_eq!(
             convert_color(TermColor::Named(NamedColor::Foreground), &empty, host),
@@ -1245,7 +1278,12 @@ mod tests {
         let light = light_surface();
         assert_eq!(
             convert_color(TermColor::Named(NamedColor::Background), &empty, light),
-            Color::Rgb(light.bg.0, light.bg.1, light.bg.2)
+            Color::Reset
+        );
+        // Explicit RGB / Indexed chips (omp userMessageBg, tool cards) stay concrete.
+        assert_eq!(
+            convert_color(TermColor::Spec(rgb(0xe8, 0xe8, 0xe8)), &empty, light),
+            Color::Rgb(0xe8, 0xe8, 0xe8)
         );
         assert_eq!(
             convert_color(TermColor::Indexed(1), &empty, dark_surface()),
@@ -1254,6 +1292,23 @@ mod tests {
         assert_eq!(
             convert_color(TermColor::Indexed(1), &empty, light_surface()),
             Color::Indexed(1)
+        );
+    }
+
+    #[test]
+    fn osc_bg_query_still_reports_host_surface_rgb() {
+        // Dual-palette guard: paint uses Reset, but child OSC 11 must still see
+        // the probed surface so omp picks light/dark correctly (DCS-wrap helps
+        // the host probe; this keeps the nested answer honest).
+        let empty = alacritty_terminal::term::color::Colors::default();
+        let light = light_surface();
+        assert_eq!(
+            resolve_color_request_rgb(NamedColor::Background as usize, &empty, light),
+            rgb(light.bg.0, light.bg.1, light.bg.2)
+        );
+        assert_ne!(
+            convert_color(TermColor::Named(NamedColor::Background), &empty, light),
+            Color::Rgb(light.bg.0, light.bg.1, light.bg.2)
         );
     }
 }

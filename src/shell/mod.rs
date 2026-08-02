@@ -3385,9 +3385,8 @@ fn rendered_line_to_ratatui(t: &Theme, rl: &RenderedLine, width: u16) -> Line<'s
         TranscriptRole::User => Style::default().fg(t.transcript_user_fg),
         TranscriptRole::Assistant => Style::default().fg(t.transcript_assistant_fg),
         TranscriptRole::Tool => Style::default().fg(t.transcript_tool_fg),
-        TranscriptRole::Thinking => {
-            Style::default().fg(t.transcript_thinking_fg).add_modifier(Modifier::ITALIC)
-        }
+        // No ITALIC here: same tmux+amux gray-bar issue as nested omp quotes.
+        TranscriptRole::Thinking => Style::default().fg(t.transcript_thinking_fg),
         TranscriptRole::Meta => Style::default().fg(t.transcript_meta_fg),
         TranscriptRole::Custom => Style::default().fg(t.transcript_assistant_fg),
     };
@@ -3403,12 +3402,14 @@ fn rendered_line_to_ratatui(t: &Theme, rl: &RenderedLine, width: u16) -> Line<'s
         if let Some(bgc) = bg {
             style = style.bg(bgc);
         }
+        // Avoid BOLD/ITALIC SGR in transcript: under tmux+amux they paint as
+        // solid bars. Emphasize with semantic colors only (underline is OK).
         match span.style {
             SpanStyle::Normal => {}
-            SpanStyle::Bold => style = style.add_modifier(Modifier::BOLD),
-            SpanStyle::Italic => style = style.add_modifier(Modifier::ITALIC),
+            SpanStyle::Bold => style = style.fg(t.accent),
+            SpanStyle::Italic => style = style.fg(t.md_quote),
             SpanStyle::Code => style = style.fg(t.md_code).bg(t.md_code_bg),
-            SpanStyle::Heading => style = style.fg(t.md_heading).add_modifier(Modifier::BOLD),
+            SpanStyle::Heading => style = style.fg(t.md_heading),
             SpanStyle::Link => style = style.fg(t.md_link).add_modifier(Modifier::UNDERLINED),
             SpanStyle::Dim => style = style.fg(t.dim),
             SpanStyle::ListBullet => style = style.fg(t.md_list_bullet),
@@ -3419,7 +3420,7 @@ fn rendered_line_to_ratatui(t: &Theme, rl: &RenderedLine, width: u16) -> Line<'s
             SpanStyle::BashBorder => style = style.fg(t.bash_mode),
             SpanStyle::EvalBorder => style = style.fg(t.python_mode),
             SpanStyle::Accent => style = style.fg(t.accent),
-            SpanStyle::CustomLabel => style = style.fg(t.custom_message_label).add_modifier(Modifier::BOLD),
+            SpanStyle::CustomLabel => style = style.fg(t.custom_message_label),
         }
         w += unicode_width::UnicodeWidthStr::width(span.text.as_str());
         spans.push(Span::styled(span.text.clone(), style));
