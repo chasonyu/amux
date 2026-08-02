@@ -21,6 +21,12 @@ amux runs your coding agent's **real TUI** inside a PTY. No fork, no RPC, no re-
 └─────────────┴──────────────────────────┘
 ```
 
+## Why
+
+In 2024, mainstream coding agents — Codex, Claude Code, Cursor — converged on a desktop GUI layout: sidebar on the left, agent conversation on the right. But if you develop remotely over SSH, that GUI doesn't follow you.
+
+amux brings that same dual-pane experience into the terminal. It wraps the [`omp`](https://github.com/nicobailon/oh-my-pi) CLI in a real PTY — no fork, no RPC, no re-rendering — so you get the full agent TUI on any machine you can SSH into.
+
 ## Features
 
 - **Real PTY embedding** — runs the stock `omp` CLI in a PTY; no fork/patch, so agent upgrades are painless
