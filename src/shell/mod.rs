@@ -35,7 +35,7 @@ use signal_hook::flag as signal_flag;
 
 use crate::appearance::{
     host_surface_from_osc11_seq, is_da1_reply, is_inside_tmux, osc11_query, parse_mode2031_dsr,
-    probe_host_surface, Appearance, HostSurface,
+    probe_host_surface, wrap_tmux_passthrough, Appearance, HostSurface,
 };
 use crate::config::{AmuxConfig, AppearanceMode};
 use crate::theme::Theme;
@@ -2311,7 +2311,8 @@ impl App {
             return Ok(());
         }
         let n = text.chars().count();
-        let seq = osc52_clipboard_set(&text);
+        let raw = osc52_clipboard_set(&text);
+        let seq = if is_inside_tmux() { wrap_tmux_passthrough(&raw) } else { raw };
         io::stdout().write_all(&seq)?;
         io::stdout().flush()?;
         self.status = format!("copied {n} chars");

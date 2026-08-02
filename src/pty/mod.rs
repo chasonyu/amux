@@ -21,7 +21,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, P
 use ratatui::style::{Color, Modifier};
 
 use crate::appearance::{
-    colorfgbg_env, mode2031_notify_bytes, palette_set_osc, Appearance, HostSurface,
+    colorfgbg_env, is_inside_tmux, mode2031_notify_bytes, palette_set_osc, wrap_tmux_passthrough, Appearance, HostSurface,
 };
 
 const WRITE_QUEUE_CAP: usize = 256 * 1024;
@@ -835,10 +835,17 @@ impl EventListener for EventProxy {
                 // (§4.2.6b)
                 let encoded = base64_encode(data.as_bytes());
                 let osc = format!("\x1b]52;c;{encoded}\x07");
+                let out: Vec<u8> = if is_inside_tmux() {
+                    // tmux swallows bare OSC 52 from panes; DCS passthrough
+                    // forwards it to the outer terminal. (§4.2.6b)
+                    wrap_tmux_passthrough(osc.as_bytes())
+                } else {
+                    osc.into_bytes()
+                };
                 self.pending
                     .lock()
                     .host_bytes
-                    .extend_from_slice(osc.as_bytes());
+                    .extend_from_slice(&out);
             }
             Event::ClipboardLoad(_clipboard, formatter) => {
                 // MUST reply — empty clipboard is fine for v1.
