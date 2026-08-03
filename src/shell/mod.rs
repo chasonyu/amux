@@ -1381,7 +1381,7 @@ impl App {
                 return Err("Session still starting — try again in a moment".into());
             }
             // Ctrl-U clears omp editor line, then slash-rename (spaces allowed).
-            let cmd = format!("\x15/rename {title}\n");
+            let cmd = format!("\x15/rename {title}\r");
             pty.enqueue_write(cmd.as_bytes())
                 .map_err(|e| format!("inject /rename: {e:#}"))?;
             self.sessions.set_live_title(id, title.clone());

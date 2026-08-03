@@ -1,6 +1,6 @@
 [package]
 name = "amux"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "amux — tmux-like terminal multiplexer for coding agents (omp-first PTY wrap)"
 license = "MIT"
