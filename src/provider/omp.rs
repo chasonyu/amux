@@ -1,5 +1,6 @@
 //! OmpProvider: list disk sessions + build spawn/resume argv.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -9,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::config::AmuxConfig;
 
@@ -141,45 +143,151 @@ impl OmpProvider {
     }
 }
 
-/// Encode cwd the way omp layouts `~/.omp/agent/sessions/<key>/`.
+/// Primary omp v17.2.5+ session bucket for `cwd` (`home-{name}-{sha256}`).
 pub fn encode_cwd_key(cwd: &Path) -> String {
-    let abs = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let abs_str = abs.to_string_lossy();
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(rel) = abs.strip_prefix(&home) {
-            let enc = rel
-                .to_string_lossy()
-                .replace('/', "-")
-                .replace('\\', "-");
-            return format!("-{enc}");
+    session_dir_names(cwd).primary
+}
+
+#[derive(Debug, Clone)]
+struct SessionDirNames {
+    primary: String,
+    legacy_relative: Option<String>,
+    legacy_absolute: String,
+}
+
+/// Match omp `getDefaultSessionDirName` (v17.2.5+), plus legacy bucket names.
+fn session_dir_names(cwd: &Path) -> SessionDirNames {
+    let resolved = canonical_cwd(cwd);
+    let normalized = resolved.to_string_lossy().replace('\\', "/");
+
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let canonical_home = canonical_cwd(&home);
+    let temp = std::env::temp_dir();
+    let canonical_temp = canonical_cwd(&temp);
+
+    let (scope, legacy_relative) = if resolved.starts_with(&canonical_home) {
+        let rel = resolved.strip_prefix(&canonical_home).unwrap_or(Path::new(""));
+        ("home", Some(encode_legacy_relative("-", rel)))
+    } else if resolved.starts_with(&canonical_temp) {
+        let rel = resolved.strip_prefix(&canonical_temp).unwrap_or(Path::new(""));
+        ("tmp", Some(encode_legacy_relative("-tmp", rel)))
+    } else {
+        ("abs", None)
+    };
+
+    let readable = readable_basename(&resolved);
+    let digest = sha256_hex(&normalized);
+    let primary = format!(
+        "{scope}-{}-{digest}",
+        if readable.is_empty() { "project" } else { &readable }
+    );
+    let legacy_absolute = encode_legacy_absolute(&resolved);
+
+    SessionDirNames {
+        primary,
+        legacy_relative,
+        legacy_absolute,
+    }
+}
+
+fn canonical_cwd(cwd: &Path) -> PathBuf {
+    cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
+}
+
+fn encode_legacy_relative(prefix: &str, relative: &Path) -> String {
+    let encoded = relative
+        .to_string_lossy()
+        .replace(['/', '\\', ':'], "-");
+    if encoded.is_empty() {
+        prefix.to_string()
+    } else if prefix.ends_with('-') {
+        format!("{prefix}{encoded}")
+    } else {
+        format!("{prefix}-{encoded}")
+    }
+}
+
+fn encode_legacy_absolute(resolved: &Path) -> String {
+    let lossy = resolved.to_string_lossy();
+    let trimmed = lossy.trim_start_matches(['/', '\\']);
+    let encoded = trimmed.replace(['/', '\\', ':'], "-");
+    format!("--{encoded}--")
+}
+
+fn readable_basename(resolved: &Path) -> String {
+    let base = resolved
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("project");
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in base.chars() {
+        let ok = c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
+        if ok {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
         }
     }
-    abs_str.replace('/', "-").replace('\\', "-")
+    let trimmed = out.trim_matches('-');
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= 80 {
+        trimmed.to_string()
+    } else {
+        chars[chars.len() - 80..].iter().collect()
+    }
+}
+
+fn sha256_hex(normalized: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn session_dir_candidates(cwd: &Path) -> Vec<String> {
+    let names = session_dir_names(cwd);
+    let mut keys = vec![names.primary];
+    if let Some(rel) = names.legacy_relative {
+        if !keys.iter().any(|k| k == &rel) {
+            keys.push(rel);
+        }
+    }
+    if !keys.iter().any(|k| k == &names.legacy_absolute) {
+        keys.push(names.legacy_absolute);
+    }
+    keys
 }
 
 pub fn list_omp_sessions(sessions_root: &Path, cwd: &Path) -> Result<Vec<OmpDiskSession>> {
-    let key = encode_cwd_key(cwd);
-    let dir = sessions_root.join(&key);
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
     let mut out = Vec::new();
-    for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = match path.file_name().and_then(|s| s.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        // Only real session files. Orphan artifacts dirs (no sibling `.jsonl`)
-        // used to be listed with Fallback title = uuid after a half-delete.
-        if !name.ends_with(".jsonl") || !path.is_file() {
+    let mut seen_paths = HashSet::new();
+    for key in session_dir_candidates(cwd) {
+        let dir = sessions_root.join(&key);
+        if !dir.is_dir() {
             continue;
         }
-        let stem = name.trim_end_matches(".jsonl");
-        let id = extract_session_id(stem);
-        if let Some(sess) = read_disk_session(id, &path) {
-            out.push(sess);
+        for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let entry = entry?;
+            let path = entry.path();
+            if !seen_paths.insert(path.clone()) {
+                continue;
+            }
+            let name = match path.file_name().and_then(|s| s.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            // Only real session files. Orphan artifacts dirs (no sibling `.jsonl`)
+            // used to be listed with Fallback title = uuid after a half-delete.
+            if !name.ends_with(".jsonl") || !path.is_file() {
+                continue;
+            }
+            let stem = name.trim_end_matches(".jsonl");
+            let id = extract_session_id(stem);
+            if let Some(sess) = read_disk_session(id, &path) {
+                out.push(sess);
+            }
         }
     }
     out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
@@ -613,8 +721,47 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         let cwd = home.join("projects/my-app");
         let key = encode_cwd_key(&cwd);
-        assert!(key.starts_with('-'), "{key}");
+        assert!(key.starts_with("home-"), "{key}");
         assert!(!key.contains('/'), "{key}");
+        let digest = key.rsplit('-').next().unwrap();
+        assert_eq!(digest.len(), 64, "{key}");
+    }
+
+    #[test]
+    fn encode_matches_omp_v17_known_hash() {
+        let normalized = "/home/user/projects/demo";
+        assert_eq!(
+            sha256_hex(normalized),
+            "6285a494fa382fda51d6fccef028996d8039b2e74dc40893851588e1402d1da8"
+        );
+        let cwd = PathBuf::from(normalized);
+        if cwd.exists() {
+            let key = encode_cwd_key(&cwd);
+            assert_eq!(
+                key,
+                "home-demo-6285a494fa382fda51d6fccef028996d8039b2e74dc40893851588e1402d1da8"
+            );
+        }
+    }
+
+    #[test]
+    fn list_merges_legacy_session_dir() {
+        let sessions_root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let legacy = session_dir_names(cwd.path())
+            .legacy_relative
+            .expect("tempdir under system temp");
+        let sess_dir = sessions_root.path().join(&legacy);
+        fs::create_dir_all(&sess_dir).unwrap();
+
+        let real = sess_dir.join("2026-08-01T00-00-00-000Z_realid.jsonl");
+        write_title_slot(&real, "Legacy Bucket");
+        let mut f = File::options().append(true).open(&real).unwrap();
+        writeln!(f, r#"{{"type":"session","id":"realid"}}"#).unwrap();
+
+        let list = list_omp_sessions(sessions_root.path(), cwd.path()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title, "Legacy Bucket");
     }
 
     #[test]

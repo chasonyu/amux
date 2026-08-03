@@ -3,7 +3,7 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey)
-![omp](https://img.shields.io/badge/omp-17.2.1-purple)
+![omp](https://img.shields.io/badge/omp-17.2.5%2B-purple)
 
 > Terminal control plane for coding-agent CLIs — wrap them in real PTYs, not RPC re-paint.
 
@@ -44,7 +44,7 @@ amux brings that same dual-pane experience into the terminal. It wraps the [`omp
 |---|---|
 | OS | Linux or macOS (Windows not supported) |
 | Rust | 1.75+ (edition 2021) |
-| omp CLI | [`omp`](https://github.com/nicobailon/oh-my-pi) on `PATH` (tested with **omp/17.2.1**) |
+| omp CLI | [`omp`](https://github.com/nicobailon/oh-my-pi) on `PATH` (tested with **omp/17.2.5+**) |
 
 ## Installation
 
