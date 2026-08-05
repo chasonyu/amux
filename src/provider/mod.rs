@@ -10,7 +10,8 @@ pub use omp::{
 };
 pub use turn_status::{agent_turn_busy, derive_disk_turn_status, DiskTurnStatus};
 pub use transcript::{
-    load, render_blocks, RenderedLine, RenderedSpan, SpanStyle, ToolKind, ToolStatus,
+    load, modified_files_scan, render_blocks, DiffKind, DiffLine, FileOp, ModifiedFile,
+    ModifiedFilesScan, RenderedLine, RenderedSpan, SpanStyle, ToolKind, ToolStatus,
     TranscriptBlock, TranscriptRole,
 };
 pub use watch::{SessionDirEvent, SessionDirWatcher};

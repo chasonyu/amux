@@ -49,9 +49,10 @@ use self::selection::{
     sgr_is_left_button, sgr_is_motion, text_from_snapshot, PaneSelection,
 };
 use crate::provider::{
-    agent_turn_busy, delete_session_with_artifacts, load, refresh_disk_session, render_blocks,
-    sanitize_session_title, write_session_title, RenderedLine, SessionDirEvent, SessionDirWatcher,
-    SpanStyle, TitleKind, TranscriptBlock, TranscriptRole,
+    agent_turn_busy, delete_session_with_artifacts, load, modified_files_scan, refresh_disk_session,
+    render_blocks, sanitize_session_title, write_session_title, DiffKind, DiffLine, FileOp,
+    ModifiedFilesScan, RenderedLine, SessionDirEvent, SessionDirWatcher, SpanStyle, TitleKind,
+    TranscriptBlock, TranscriptRole,
 };
 use crate::pty::MirroredModes;
 use crate::raw_input::{is_sgr_mouse, RawInputParser};
@@ -64,6 +65,10 @@ const WHEEL_SCROLL_LINES: i32 = 2;
 const TITLE_FALLBACK_POLL: Duration = Duration::from_secs(3);
 /// Session-list double-click → attach (same as Enter).
 const SESSION_DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// AgentMode intercept: Ctrl+N (0x0e) — toggle the modified-files panel.
+/// Verified unbound by omp/pi-tui (not in app/tui keybindings, not reserved,
+/// not an ASCII collider). See keybindings audit in design notes.
+const CTRL_N_BYTE: u8 = 0x0e;
 
 use self::dir_browser::{draw_dir_browser, BrowserResult, DirBrowser};
 use self::mode_mirror::{apply_host_modes, apply_nav_host_modes, baseline_host_modes, KbNegotiated};
@@ -74,6 +79,9 @@ enum Focus {
     Nav,
     Agent,
     Modal,
+    /// Split the Agent pane: left keeps the PTY, right shows file diffs.
+    /// amux owns input (j/k files, scroll diff) — like Nav owns the sidebar.
+    File,
 }
 
 #[derive(Debug)]
@@ -179,6 +187,19 @@ pub struct App {
     pane_sel: Option<PaneSelection>,
     /// Last session-row click for double-click attach `(when, index)`.
     last_session_click: Option<(Instant, usize)>,
+    /// FILE mode: an independent third column (sidebar | agent | files) showing
+    /// file-change diffs. `File` focus owns input (j/k select file, ↑↓/wheel
+    /// scroll diff, Ctrl-N/Esc toggles the column off).
+    show_files_panel: bool,
+    file_selected: usize,
+    /// Diff scroll offset (lines from top) for the focused file in FILE mode.
+    diff_scroll: usize,
+    /// Focus to restore when leaving FILE mode (Agent or Nav).
+    file_prev_focus: Focus,
+    /// Cached modified-files aggregation for the files panel.
+    modified_files_cache: Option<ModifiedFilesCache>,
+    /// Right pane outer rect for the files column (empty when hidden).
+    files_rect: Rect,
 }
 
 struct TranscriptCache {
@@ -188,6 +209,26 @@ struct TranscriptCache {
     blocks: Vec<TranscriptBlock>,
     /// Lines above the bottom edge currently scrolled away (0 = pinned to tail).
     scroll_from_bottom: usize,
+}
+
+
+/// Incremental modified-files aggregate for one session file, plus the
+/// rendered diff of the focused row. Both are keyed so a repaint reuses them:
+/// the panel redraws on every PTY burst, and neither re-scanning the JSONL nor
+/// re-diffing per frame would be affordable.
+struct ModifiedFilesCache {
+    path: PathBuf,
+    /// Size at the last poll; unchanged size means nothing was appended.
+    size: u64,
+    scan: ModifiedFilesScan,
+    diff: Option<DiffCache>,
+}
+
+struct DiffCache {
+    /// [`ModifiedFilesScan::version`] the lines were rendered from.
+    version: u64,
+    file_index: usize,
+    lines: Vec<DiffLine>,
 }
 
 impl App {
@@ -244,6 +285,12 @@ impl App {
             transcript_cache: None,
             pane_sel: None,
             last_session_click: None,
+            show_files_panel: false,
+            file_selected: 0,
+            diff_scroll: 0,
+            file_prev_focus: Focus::Nav,
+            modified_files_cache: None,
+            files_rect: Rect::default(),
         })
     }
 
@@ -454,7 +501,8 @@ impl App {
                     match self.focus {
                         Focus::Agent => self.route_agent_bytes(&bytes)?,
                         // Shell/Modal: deliver Esc to chrome (close modal, etc.).
-                        Focus::Nav | Focus::Modal => {
+                        // Shell/Modal/File: deliver Esc to chrome.
+                        Focus::Nav | Focus::Modal | Focus::File => {
                             if self.modal.is_some() {
                                 self.handle_modal_seq(&bytes)?;
                             } else {
@@ -554,7 +602,9 @@ impl App {
                     let bytes = &buf[..n];
                     match self.focus {
                         Focus::Agent => self.handle_agent_raw(bytes)?,
-                        Focus::Nav | Focus::Modal => self.handle_shell_bytes(bytes)?,
+                        Focus::Nav | Focus::Modal | Focus::File => {
+                            self.handle_shell_bytes(bytes)?
+                        }
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -786,6 +836,13 @@ impl App {
             if self.consume_host_appearance_seq(&seq.bytes) {
                 continue;
             }
+            // Ctrl+N: split pane → FILE mode (left PTY, right file diffs).
+            // Verified unbound by omp — see CTRL_N_BYTE doc.
+            if seq.bytes == [CTRL_N_BYTE] {
+                self.escape.clear();
+                self.enter_file()?;
+                continue;
+            }
 
             if self.escape.is_escape_seq(&seq.bytes) {
                 let action = self.escape.on_escape(Instant::now());
@@ -953,6 +1010,8 @@ impl App {
             }
         }
         self.focus = Focus::Agent;
+        // Files column hides when leaving FILE mode; pty resize is layout-driven.
+        self.show_files_panel = false;
         if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
             s.unread = false;
         }
@@ -1005,11 +1064,16 @@ impl App {
                 if self.modal.is_some() {
                     continue;
                 }
-                // Nav: wheel over Agent pane scrolls preview/PTY history — stay in Nav.
+                // Nav: wheel over Agent pane scrolls preview/PTY history.
+                // File mode: wheel anywhere scrolls the diff panel.
                 if let Some(wheel) = sgr_wheel_delta(&seq.bytes) {
                     if let Some((x, y)) = parse_sgr_xy(&seq.bytes) {
                         let pty = self.pty_area;
-                        if point_in_rect(x, y, pty.x, pty.y, pty.width, pty.height) {
+                        let files = self.files_rect;
+                        if self.focus == Focus::File
+                            || point_in_rect(x, y, pty.x, pty.y, pty.width, pty.height)
+                            || point_in_rect(x, y, files.x, files.y, files.width, files.height)
+                        {
                             let _ = self.scroll_agent_pane(wheel);
                         }
                     }
@@ -1029,8 +1093,10 @@ impl App {
                 continue;
             }
             if self.escape.is_escape_seq(&seq.bytes) && self.modal.is_none() {
-                // Toggle to agent if we have a focused session
-                if self.focused_session_id.is_some() {
+                if self.focus == Focus::File {
+                    self.exit_file()?;
+                } else if self.focused_session_id.is_some() {
+                    // Toggle to agent if we have a focused session
                     self.enter_agent()?;
                 }
                 continue;
@@ -1096,6 +1162,10 @@ impl App {
     }
 
     fn handle_shell_seq(&mut self, seq: &[u8]) -> Result<()> {
+        // FILE mode owns its own keys (j/k files, ↑↓ scroll, m/Ctrl-N/Esc exit).
+        if self.focus == Focus::File {
+            return self.handle_file_seq(seq);
+        }
         match seq {
             b"q" | b"Q" => {
                 self.modal = Some(Modal::ConfirmQuit { yes_focused: true });
@@ -1105,6 +1175,7 @@ impl App {
                 self.modal = Some(Modal::Help);
                 self.focus = Focus::Modal;
             }
+            b"m" | b"M" | b"\x0e" => self.enter_file()?,
             b"a" | b"A" => self.open_dir_browser()?,
             b"n" | b"N" => self.new_session()?,
             b"j" | b"\x1b[B" => self.move_session(1),
@@ -1133,6 +1204,85 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+
+    /// Enter FILE mode: show the independent files column and focus it. amux
+    /// owns input (like Nav). The agent column keeps rendering the PTY
+    /// (resized to its new narrower width by draw_live_pty next frame).
+    /// No-op without a selected session with a disk file.
+    fn enter_file(&mut self) -> Result<()> {
+        let Some(s) = self.session_list.get(self.selected_session).cloned() else {
+            self.status = "No session selected".into();
+            return Ok(());
+        };
+        if s.path.is_none() {
+            self.status = "No session file yet — attach first".into();
+            return Ok(());
+        }
+        if self.focus != Focus::File {
+            self.file_prev_focus = self.focus;
+        }
+        // amux owns input in FILE mode (like Nav): arm nav host modes.
+        execute!(io::stdout(), EnableMouseCapture)?;
+        apply_nav_host_modes(&mut io::stdout())?;
+        self.last_host_modes = MirroredModes::default();
+        self.show_files_panel = true;
+        self.focus = Focus::File;
+        self.file_selected = 0;
+        self.diff_scroll = 0;
+        self.status.clear();
+        Ok(())
+    }
+
+    /// Exit FILE mode: hide the files column and restore the prior focus.
+    /// Delegates to enter_agent / enter_nav so host modes + pty focus
+    /// reporting are handled consistently.
+    fn exit_file(&mut self) -> Result<()> {
+        self.show_files_panel = false;
+        let prev = self.file_prev_focus;
+        match prev {
+            Focus::Agent => self.enter_agent()?,
+            _ => self.enter_nav()?,
+        }
+        Ok(())
+    }
+
+    /// FILE-mode key dispatch: j/k select file, ↑↓/wheel scroll diff,
+    /// m/Ctrl-N/Esc/Ctrl-\ exit back to the prior focus.
+    fn handle_file_seq(&mut self, seq: &[u8]) -> Result<()> {
+        match seq {
+            b"j" | b"\x1b[B" => self.move_file(1),
+            b"k" | b"\x1b[A" => self.move_file(-1),
+            b"\x1b[5~" | b"\x04" => self.scroll_diff(-4), // PgUp / Ctrl-D
+            b"\x1b[6~" | b"\x05" => self.scroll_diff(4),  // PgDn / Ctrl-E
+            b"\x0e" | b"m" | b"M" | b"\x1b" => self.exit_file()?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn move_file(&mut self, delta: i32) {
+        let n = match &self.modified_files_cache {
+            Some(c) => c.scan.files().len(),
+            None => 0,
+        };
+        if n == 0 {
+            return;
+        }
+        let next = (self.file_selected as i32 + delta).rem_euclid(n as i32) as usize;
+        if next != self.file_selected {
+            self.file_selected = next;
+            self.diff_scroll = 0;
+        }
+    }
+
+    fn scroll_diff(&mut self, lines: i32) {
+        if lines >= 0 {
+            self.diff_scroll = self.diff_scroll.saturating_add(lines as usize);
+        } else {
+            self.diff_scroll = self.diff_scroll.saturating_sub((-lines) as usize);
+        }
     }
 
     fn handle_modal_seq(&mut self, seq: &[u8]) -> Result<()> {
@@ -1733,18 +1883,38 @@ impl App {
                 .constraints([Constraint::Min(1), Constraint::Length(STATUS_H)])
                 .split(size)
         } else {
-            let body = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(sidebar_w), Constraint::Min(10)])
-                .split(Rect {
-                    x: size.x,
-                    y: size.y,
-                    width: size.width,
-                    height: size.height.saturating_sub(STATUS_H),
-                });
-            self.draw_sidebar(f, body[0]);
-            self.pty_area = body[1];
-            self.draw_pty(f, body[1]);
+            let body_area = Rect {
+                x: size.x,
+                y: size.y,
+                width: size.width,
+                height: size.height.saturating_sub(STATUS_H),
+            };
+            let cols = if self.show_files_panel {
+                // Three independent panels: sidebar | agent | files (agent & files
+                // split the remaining width evenly).
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(sidebar_w),
+                        Constraint::Min(10),
+                        Constraint::Min(10),
+                    ])
+                    .split(body_area)
+            } else {
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Length(sidebar_w), Constraint::Min(10)])
+                    .split(body_area)
+            };
+            self.draw_sidebar(f, cols[0]);
+            self.pty_area = cols[1];
+            self.draw_pty(f, cols[1]);
+            if self.show_files_panel && cols.len() > 2 {
+                self.files_rect = cols[2];
+                self.draw_files_panel(f, cols[2]);
+            } else {
+                self.files_rect = Rect::default();
+            }
             let status_area = Rect {
                 x: size.x,
                 y: size.y + size.height.saturating_sub(STATUS_H),
@@ -1785,7 +1955,7 @@ impl App {
             .title(Span::styled(
                 match self.focus {
                     Focus::Nav => " Workspaces [Nav] ",
-                    Focus::Agent | Focus::Modal => " Workspaces ",
+                    Focus::Agent | Focus::Modal | Focus::File => " Workspaces ",
                 },
                 section_title,
             ))
@@ -1970,8 +2140,6 @@ impl App {
     }
 
     fn draw_pty(&mut self, f: &mut Frame, area: Rect) {
-        let t = &self.theme;
-        let focused = self.focus == Focus::Agent;
         // Browse selected session; fall back to focused (after fork rebind etc.).
         let view = self
             .session_list
@@ -1981,6 +2149,7 @@ impl App {
                 let id = self.focused_session_id.as_ref()?;
                 self.session_list.iter().find(|s| s.id == *id).cloned()
             });
+        let focused = self.focus == Focus::Agent;
         let title = match view.as_ref().map(|s| s.id.as_str()) {
             Some(id) => {
                 let short = if id.len() > 36 {
@@ -1992,26 +2161,32 @@ impl App {
             }
             None => " Agent (no session) ".into(),
         };
-        let title_style = if focused {
-            Style::default()
-                .fg(t.title_focused)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(t.title_normal)
-        };
-        let block = Block::default()
-            .title(Span::styled(title, title_style))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(if focused {
-                t.border_focused
+        // Theme borrow scoped to block construction so it drops before the
+        // FILE-mode split calls back into &mut self methods.
+        let inner = {
+            let t = &self.theme;
+            let title_style = if focused {
+                Style::default()
+                    .fg(t.title_focused)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                t.border_normal
-            }))
-            .style(Style::default().bg(t.app_bg));
-        let inner = block.inner(area);
+                Style::default().fg(t.title_normal)
+            };
+            let block = Block::default()
+                .title(Span::styled(title, title_style))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(if focused {
+                    t.border_focused
+                } else {
+                    t.border_normal
+                }))
+                .style(Style::default().bg(t.app_bg));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            inner
+        };
         self.pty_area = inner;
-        f.render_widget(block, area);
 
         let Some(summary) = view else {
             let mut spans = vec![self.theme.desc_span("Select a session and press ")];
@@ -2032,8 +2207,10 @@ impl App {
             .get(&id)
             .is_some_and(|pty| !pty.is_exited());
 
+        // Agent column renders the full pane (the files column is a sibling).
+        let content = inner;
         if running {
-            self.draw_live_pty(f, inner, &id);
+            self.draw_live_pty(f, content, &id);
             self.paint_pane_sel_overlay(f);
             return;
         }
@@ -2043,13 +2220,13 @@ impl App {
             .sessions
             .get(&id)
             .is_some_and(|pty| pty.is_exited());
-        let mut body = inner;
+        let mut body = content;
         if exited {
             let banner_area = Rect {
-                x: inner.x,
-                y: inner.y,
-                width: inner.width,
-                height: 1.min(inner.height),
+                x: content.x,
+                y: content.y,
+                width: content.width,
+                height: 1.min(content.height),
             };
             let mut spans = vec![Span::styled(
                 "Session exited · ",
@@ -2063,12 +2240,12 @@ impl App {
             spans.extend(self.theme.key_badge("x"));
             spans.push(Span::styled(" close", Style::default().fg(Color::Red)));
             f.render_widget(Paragraph::new(Line::from(spans)), banner_area);
-            if inner.height > 1 {
+            if content.height > 1 {
                 body = Rect {
-                    x: inner.x,
-                    y: inner.y + 1,
-                    width: inner.width,
-                    height: inner.height - 1,
+                    x: content.x,
+                    y: content.y + 1,
+                    width: content.width,
+                    height: content.height - 1,
                 };
             } else {
                 return;
@@ -2079,7 +2256,7 @@ impl App {
             f.render_widget(
                 Paragraph::new(Span::styled(
                     "No session file yet.",
-                    Style::default().fg(t.hint_desc_fg),
+                    Style::default().fg(self.theme.hint_desc_fg),
                 )),
                 body,
             );
@@ -2088,6 +2265,196 @@ impl App {
         self.ensure_transcript_cache(&path, summary.mtime, summary.size, summary.provider);
         self.draw_transcript_preview(f, body);
         self.paint_pane_sel_overlay(f);
+    }
+
+    /// Independent files column (sidebar | agent | files). Renders its own
+    /// bordered Block with an active border/title when FILE-focused, then the
+    /// selected file's unified diff inside. Fetches the focused session like
+    /// draw_pty so it works in any focus.
+    fn draw_files_panel(&mut self, f: &mut Frame, area: Rect) {
+        if area.height == 0 || area.width == 0 {
+            self.files_rect = area;
+            return;
+        }
+        let focused = self.focus == Focus::File;
+        let title = match self
+            .session_list
+            .get(self.selected_session)
+            .map(|s| s.id.as_str())
+        {
+            Some(id) => {
+                let short = if id.len() > 30 {
+                    format!("{}…", &id[..29])
+                } else {
+                    id.to_string()
+                };
+                if focused {
+                    format!(" Files [FILE] · {short} ")
+                } else {
+                    format!(" Files · {short} ")
+                }
+            }
+            None => " Files ".into(),
+        };
+        let inner = {
+            let t = &self.theme;
+            let title_style = if focused {
+                Style::default()
+                    .fg(t.title_focused)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t.title_normal)
+            };
+            let block = Block::default()
+                .title(Span::styled(title, title_style))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(if focused {
+                    t.border_focused
+                } else {
+                    t.border_normal
+                }))
+                .style(Style::default().bg(t.app_bg));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            inner
+        };
+        self.files_rect = area;
+
+        let Some(summary) = self
+            .session_list
+            .get(self.selected_session)
+            .cloned()
+            .or_else(|| {
+                let id = self.focused_session_id.as_ref()?;
+                self.session_list.iter().find(|s| s.id == *id).cloned()
+            })
+        else {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "Select a session to see its file changes.",
+                    Style::default().fg(self.theme.hint_desc_fg).bg(self.theme.app_bg),
+                )),
+                inner,
+            );
+            return;
+        };
+        let Some(path) = summary.path.clone() else {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "No session file yet — attach first to populate diffs.",
+                    Style::default().fg(self.theme.hint_desc_fg).bg(self.theme.app_bg),
+                )),
+                inner,
+            );
+            return;
+        };
+        self.ensure_modified_files_cache(&path, summary.size, summary.provider, &summary.cwd);
+        let file_index = self.clamp_file_selected();
+        self.ensure_diff_cache(file_index);
+
+        let t = &self.theme;
+        let cache = self.modified_files_cache.as_ref();
+        let files = cache.map(|c| c.scan.files()).unwrap_or(&[]);
+        let diff: &[DiffLine] = cache
+            .and_then(|c| c.diff.as_ref())
+            .map(|d| d.lines.as_slice())
+            .unwrap_or(&[]);
+
+        let w = inner.width as usize;
+        let h = inner.height as usize;
+
+        // Header: [i/n] path ×count op  time  (one line).
+        let mut lines: Vec<Line> = Vec::new();
+        if files.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No files modified in this session.".to_string(),
+                Style::default().fg(t.hint_desc_fg).bg(t.app_bg),
+            )));
+        } else {
+            let f = &files[file_index];
+            let (op_ch, op_fg) = match f.last_op {
+                FileOp::Write => ('+', t.success),
+                FileOp::Edit => ('~', t.accent),
+            };
+            let time = short_time(f.last_time.as_deref());
+            let head = format!("[{}/{}] ", file_index + 1, files.len());
+            let path_disp = truncate_to_width(&f.path, w.saturating_sub(20).max(8));
+            let mut spans = vec![Span::styled(
+                head,
+                Style::default().fg(t.hint_dim_desc_fg).bg(t.app_bg),
+            )];
+            spans.push(Span::styled(
+                op_ch.to_string(),
+                Style::default().fg(op_fg).bg(t.app_bg).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(" ", Style::default().bg(t.app_bg)));
+            spans.push(Span::styled(path_disp, Style::default().fg(t.text_fg).bg(t.app_bg)));
+            spans.push(Span::styled(
+                format!(" ×{} {}", f.count, time),
+                Style::default().fg(t.hint_dim_desc_fg).bg(t.app_bg),
+            ));
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(Span::styled(
+            "─".repeat(w.min(120)),
+            Style::default().fg(t.border_muted).bg(t.app_bg),
+        )));
+
+        // Body: the focused file's diff, rendered once per aggregate version.
+        let body_h = h.saturating_sub(3); // header + rule + footer
+        if files.is_empty() || body_h == 0 {
+            f.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(t.app_bg)),
+                inner,
+            );
+            return;
+        }
+        if diff.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "(no textual change captured for this file)",
+                Style::default().fg(t.hint_dim_desc_fg).bg(t.app_bg),
+            )));
+        }
+
+        let total = diff.len();
+        let scroll = self.diff_scroll.min(total.saturating_sub(body_h));
+        let start = scroll;
+        let end = (start + body_h).min(total);
+        let gutter_w = 2; // "+ " / "- " / "  "
+        let line_w = w.saturating_sub(gutter_w).max(1);
+        for dl in diff.iter().skip(start).take(end - start) {
+            let (ch, col) = match dl.kind {
+                DiffKind::Context => (' ', t.hint_dim_desc_fg),
+                DiffKind::Add => ('+', t.success),
+                DiffKind::Del => ('-', t.error),
+            };
+            let text = truncate_to_width(&dl.text, line_w);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{ch} "),
+                    Style::default().fg(col).bg(t.app_bg).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(text, Style::default().fg(col).bg(t.app_bg)),
+            ]));
+        }
+        // Pad to body height so the footer sits at the bottom.
+        while lines.len() < h.saturating_sub(1) {
+            lines.push(Line::from(""));
+        }
+
+        // Footer hint.
+        lines.push(Line::from(vec![
+            Span::styled(
+                " j/k file · ↑↓ scroll · Ctrl-N/Esc exit",
+                Style::default().fg(t.hint_dim_desc_fg).bg(t.app_bg),
+            ),
+        ]));
+
+        f.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(t.app_bg)),
+            inner,
+        );
     }
 
     fn paint_pane_sel_overlay(&self, f: &mut Frame) {
@@ -2181,6 +2548,75 @@ impl App {
             size,
             blocks,
             scroll_from_bottom: 0,
+        });
+    }
+
+
+    /// Refresh the modified-files aggregation for `path`. A different session
+    /// starts a fresh scan; otherwise only the bytes appended since the last
+    /// poll are parsed, and an unchanged size costs nothing.
+    fn ensure_modified_files_cache(&mut self, path: &Path, size: u64, provider: &str, cwd: &Path) {
+        if self
+            .modified_files_cache
+            .as_ref()
+            .is_none_or(|c| c.path != path)
+        {
+            let Some(scan) = modified_files_scan(provider, cwd) else {
+                self.modified_files_cache = None;
+                return;
+            };
+            self.modified_files_cache = Some(ModifiedFilesCache {
+                path: path.to_path_buf(),
+                size: u64::MAX,
+                scan,
+                diff: None,
+            });
+            self.file_selected = 0;
+            self.diff_scroll = 0;
+        }
+        let Some(cache) = self.modified_files_cache.as_mut() else {
+            return;
+        };
+        if cache.size == size {
+            return;
+        }
+        cache.size = size;
+        cache.scan.poll(path);
+    }
+
+    /// Keep the row cursor inside the current aggregate; returns its index.
+    fn clamp_file_selected(&mut self) -> usize {
+        let n = self
+            .modified_files_cache
+            .as_ref()
+            .map_or(0, |c| c.scan.files().len());
+        if n == 0 {
+            self.file_selected = 0;
+        } else if self.file_selected >= n {
+            self.file_selected = n - 1;
+            self.diff_scroll = 0;
+        }
+        self.file_selected
+    }
+
+    /// Render the focused file's diff when the aggregate or the row changed.
+    fn ensure_diff_cache(&mut self, file_index: usize) {
+        let Some(cache) = self.modified_files_cache.as_mut() else {
+            return;
+        };
+        let version = cache.scan.version();
+        if cache
+            .diff
+            .as_ref()
+            .is_some_and(|d| d.version == version && d.file_index == file_index)
+        {
+            return;
+        }
+        let lines = cache.scan.file_diff(file_index);
+        cache.diff = Some(DiffCache {
+            version,
+            file_index,
+            lines,
         });
     }
 
@@ -2371,6 +2807,11 @@ impl App {
     /// Live session → PTY history; disk/exited → JSONL preview offset.
     fn scroll_agent_pane(&mut self, wheel: i32) -> bool {
         let lines = -wheel * WHEEL_SCROLL_LINES;
+        // FILE mode owns the wheel → scroll the diff panel.
+        if self.focus == Focus::File {
+            self.scroll_diff(lines);
+            return true;
+        }
         let Some(summary) = self.session_list.get(self.selected_session).cloned() else {
             return false;
         };
@@ -2475,9 +2916,15 @@ impl App {
         };
 
         let hints: &[(&str, &str)] = match self.focus {
-            Focus::Agent => &[("Ctrl-\\", "nav")],
+            Focus::Agent => &[("Ctrl-\\", "nav"), ("Ctrl-N", "files")],
+            Focus::File => &[
+                ("j/k", "file"),
+                ("↑↓/wheel", "diff"),
+                ("Ctrl-N/Esc", "exit"),
+            ],
             Focus::Nav | Focus::Modal => &[
                 ("Ctrl-\\", "agent"),
+                ("m", "files"),
                 ("a", "add workspace"),
                 ("n", "new session"),
                 ("r", "rename"),
@@ -2512,6 +2959,7 @@ impl App {
         let t = &self.theme;
         let (mode_label, mode_bg) = match self.focus {
             Focus::Agent => (" AGENT ", t.status_mode_agent_bg),
+            Focus::File => (" FILE ", t.accent),
             Focus::Nav => (" NAV ", t.status_mode_shell_bg),
             Focus::Modal => (" MODAL ", t.status_mode_modal_bg),
         };
@@ -2747,6 +3195,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
         ("click", "select workspace/session · Agent pane attaches"),
         ("dbl-click", "session row → attach / resume (same as Enter)"),
         ("drag", "select text in Agent pane (clipped; Alt/Shift if omp owns mouse)"),
+        ("Ctrl-N", "Agent → modified-files panel · Nav m toggles it"),
         ("Esc", "close this help"),
     ] {
         lines.push(help_key_row(k, d));
@@ -3585,4 +4034,22 @@ mod escape_key_tests {
         assert_eq!(confirm_key(b"\x1b", &mut yes), ConfirmResult::No);
         assert_eq!(confirm_key(b"n", &mut yes), ConfirmResult::No);
     }
+}
+
+
+
+/// Extract HH:MM:SS from an ISO 8601 timestamp like
+/// "2026-08-01T13:56:54.689Z" → "13:56:54". Falls back to the raw tail.
+fn short_time(ts: Option<&str>) -> String {
+    let Some(s) = ts else {
+        return "  --:--:--".into();
+    };
+    // Find the 'T' separator, then take 8 chars (HH:MM:SS) after it.
+    if let Some(pos) = s.find('T') {
+        let tail = &s[pos + 1..];
+        if tail.len() >= 8 {
+            return tail[..8].to_string();
+        }
+    }
+    s.get(s.len().saturating_sub(8)..).unwrap_or(s).to_string()
 }
