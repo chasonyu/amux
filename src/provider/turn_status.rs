@@ -1,18 +1,14 @@
-//! Derive whether an omp agent turn is still in progress from the JSONL tail.
+//! Derive omp main-turn status and track background jobs from session JSONL.
 //!
-//! Listing status mirrors oh-my-pi `session-listing.ts`
-//! `deriveSessionStatus` / `statusFromTailMessage`.
-//!
-//! Sidebar spinner (`agent_turn_busy`) is stricter than listing status:
-//! trailing `toolResult` only counts as busy while the previous assistant
-//! turn still has unanswered `toolCall`s. Once every tool has returned, we
-//! stop the wave even if omp never wrote a final assistant message (stuck /
-//! abandoned mid-turn) — prefer brief false-idle over infinite false-busy.
+//! Main-turn status mirrors oh-my-pi `session-listing.ts`
+//! `deriveSessionStatus` / `statusFromTailMessage`. Background task events are
+//! reduced incrementally because a stopped main turn can still be a scheduling
+//! pause while an async result is expected.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -31,45 +27,218 @@ pub enum DiskTurnStatus {
     Unknown,
 }
 
-/// True when the sidebar should show an in-progress spinner.
-///
-/// Strict gates (avoid “idle shown as busy” / “busy shown as idle” where we can):
-/// - `live && pty_active` (Starting/Running); Exited/Disk never spin
-/// - JSONL path required (no guess for pre-file synthetic sessions)
-/// - `pending` (trailing user) → busy
-/// - `interrupted` with unanswered toolCalls (assistant tail or partial toolResults) → busy
-/// - trailing `toolResult` with all toolCalls answered → **not** busy
-/// - `unknown` / `complete` / `aborted` / `error` → no spinner
-pub fn agent_turn_busy(live: bool, pty_active: bool, path: Option<&Path>) -> bool {
-    if !live || !pty_active {
-        return false;
+#[derive(Debug, Default)]
+struct ActivityFileState {
+    offset: u64,
+    outstanding_jobs: HashSet<String>,
+}
+
+#[derive(Debug)]
+struct TrackedSession {
+    path: PathBuf,
+    file: ActivityFileState,
+}
+
+#[derive(Debug, Default)]
+pub struct SessionActivityTracker {
+    sessions: HashMap<String, TrackedSession>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivityEntry<'a> {
+    #[serde(rename = "type")]
+    kind: Option<&'a str>,
+    #[serde(rename = "customType")]
+    custom_type: Option<&'a str>,
+    #[serde(borrow)]
+    message: Option<ActivityMessage<'a>>,
+    #[serde(borrow)]
+    details: Option<ActivityDetails<'a>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivityMessage<'a> {
+    role: Option<&'a str>,
+    #[serde(rename = "toolName")]
+    tool_name: Option<&'a str>,
+    #[serde(borrow)]
+    details: Option<ActivityDetails<'a>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivityDetails<'a> {
+    #[serde(borrow)]
+    progress: Option<Vec<ActivityJob<'a>>>,
+    #[serde(borrow)]
+    jobs: Option<Vec<ActivityJob<'a>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivityJob<'a> {
+    id: Option<&'a str>,
+    #[serde(rename = "jobId")]
+    job_id: Option<&'a str>,
+    status: Option<&'a str>,
+}
+
+impl SessionActivityTracker {
+    pub fn busy(
+        &mut self,
+        session_id: &str,
+        live: bool,
+        pty_active: bool,
+        path: Option<&Path>,
+    ) -> bool {
+        if !live || !pty_active {
+            self.forget(session_id);
+            return false;
+        }
+        let Some(path) = path else {
+            self.forget(session_id);
+            return false;
+        };
+        let turn_busy = match derive_disk_turn_status(path) {
+            DiskTurnStatus::Pending => true,
+            DiskTurnStatus::Interrupted => tools_still_in_flight(path),
+            _ => false,
+        };
+        let async_busy = self.refresh(session_id, path);
+        turn_busy || async_busy
     }
-    let Some(path) = path else {
-        return false;
-    };
-    match derive_disk_turn_status(path) {
-        DiskTurnStatus::Pending => true,
-        DiskTurnStatus::Interrupted => tools_still_in_flight(path),
-        _ => false,
+
+    pub fn forget(&mut self, session_id: &str) {
+        self.sessions.remove(session_id);
+    }
+
+    fn refresh(&mut self, session_id: &str, path: &Path) -> bool {
+        let needs_reset = self
+            .sessions
+            .get(session_id)
+            .is_none_or(|tracked| tracked.path != path);
+        if needs_reset {
+            self.sessions.insert(
+                session_id.to_owned(),
+                TrackedSession {
+                    path: path.to_path_buf(),
+                    file: ActivityFileState::default(),
+                },
+            );
+        }
+        let tracked = self
+            .sessions
+            .get_mut(session_id)
+            .expect("tracked session inserted above");
+        refresh_activity_file(path, &mut tracked.file);
+        !tracked.file.outstanding_jobs.is_empty()
     }
 }
 
-pub fn derive_disk_turn_status(path: &Path) -> DiskTurnStatus {
-    let Some(message) = last_tail_message(path) else {
-        return DiskTurnStatus::Unknown;
+fn refresh_activity_file(path: &Path, state: &mut ActivityFileState) {
+    let Ok(mut file) = File::open(path) else {
+        return;
     };
-    status_from_tail_message(&message)
+    let Ok(len) = file.metadata().map(|metadata| metadata.len()) else {
+        return;
+    };
+    if len < state.offset {
+        *state = ActivityFileState::default();
+    }
+    if file.seek(SeekFrom::Start(state.offset)).is_err() {
+        return;
+    }
+
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let line_start = state.offset;
+        let Ok(read) = reader.read_until(b'\n', &mut line) else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        if line.last() != Some(&b'\n') {
+            return;
+        }
+        state.offset = line_start + read as u64;
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.first() != Some(&b'{') {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_slice::<ActivityEntry<'_>>(&line) else {
+            continue;
+        };
+        apply_activity_entry(&entry, &mut state.outstanding_jobs);
+    }
+}
+
+fn apply_activity_entry(entry: &ActivityEntry<'_>, jobs: &mut HashSet<String>) {
+    if entry.kind == Some("custom_message") && entry.custom_type == Some("async-result") {
+        if let Some(results) = entry
+            .details
+            .as_ref()
+            .and_then(|details| details.jobs.as_deref())
+        {
+            for result in results {
+                if let Some(id) = result.job_id {
+                    jobs.remove(id);
+                }
+            }
+        }
+        return;
+    }
+    if entry.kind != Some("message") {
+        return;
+    }
+    let Some(message) = entry.message.as_ref() else {
+        return;
+    };
+    if message.role != Some("toolResult") {
+        return;
+    }
+    let statuses = match message.tool_name {
+        Some("task") => message
+            .details
+            .as_ref()
+            .and_then(|details| details.progress.as_deref()),
+        Some("hub") => message
+            .details
+            .as_ref()
+            .and_then(|details| details.jobs.as_deref()),
+        _ => None,
+    };
+    let Some(statuses) = statuses else {
+        return;
+    };
+    for job in statuses {
+        apply_job_status(job.id, job.status, jobs);
+    }
+}
+
+fn apply_job_status(id: Option<&str>, status: Option<&str>, jobs: &mut HashSet<String>) {
+    let Some(id) = id.filter(|id| !id.is_empty()) else {
+        return;
+    };
+    match status {
+        Some("pending" | "running") => {
+            if !jobs.contains(id) {
+                jobs.insert(id.to_owned());
+            }
+        }
+        Some("completed" | "failed" | "aborted" | "cancelled") => {
+            jobs.remove(id);
+        }
+        _ => {}
+    }
 }
 
 /// Whether the latest tool loop still has unanswered `toolCall`s.
-///
-/// - Trailing assistant with `toolCall` → true (tools not finished writing results)
-/// - Trailing `toolResult`s → true only if the preceding assistant still has
-///   a `toolCall` id without a matching result
-/// - Otherwise → false (including “all tools returned, waiting on model”)
 fn tools_still_in_flight(path: &Path) -> bool {
     let Ok(lines) = read_tail_lines(path) else {
-        // Fail closed on I/O: keep prior Interrupted semantics (busy).
         return true;
     };
     let mut seen_results: HashSet<String> = HashSet::new();
@@ -95,7 +264,6 @@ fn tools_still_in_flight(path: &Path) -> bool {
             Some("assistant") => {
                 let calls = tool_call_ids(message.content.as_ref());
                 if calls.is_empty() {
-                    // Text-only / aborted assistant — not a live tool loop.
                     return false;
                 }
                 return calls.iter().any(|id| !seen_results.contains(id));
@@ -104,28 +272,7 @@ fn tools_still_in_flight(path: &Path) -> bool {
             _ => continue,
         }
     }
-    // Interrupted (e.g. length truncate) without a resolvable tool loop —
-    // keep spinning rather than falsely clearing a mid-flight turn.
     true
-}
-
-fn last_tail_message(path: &Path) -> Option<TailMessage> {
-    let lines = read_tail_lines(path).ok()?;
-    for line in lines.iter().rev() {
-        if line.is_empty() || !line.as_bytes().starts_with(b"{") {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<TailEntry>(line) else {
-            continue;
-        };
-        if entry.kind.as_deref() != Some("message") {
-            continue;
-        }
-        if let Some(message) = entry.message {
-            return Some(message);
-        }
-    }
-    None
 }
 
 fn read_tail_lines(path: &Path) -> std::io::Result<Vec<String>> {
@@ -141,17 +288,44 @@ fn read_tail_lines(path: &Path) -> std::io::Result<Vec<String>> {
     f.read_to_end(&mut buf)?;
     let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
-    // When we started mid-file, the first line may be a partial fragment.
     if start > 0 && !lines.is_empty() {
         lines.remove(0);
     }
     Ok(lines)
 }
 
+pub fn derive_disk_turn_status(path: &Path) -> DiskTurnStatus {
+    let Ok(lines) = read_tail_lines(path) else {
+        return DiskTurnStatus::Unknown;
+    };
+
+    for line in lines.iter().rev() {
+        if line.is_empty() || !line.as_bytes().starts_with(b"{") {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<TailEntry>(line) else {
+            continue;
+        };
+        if entry.kind.as_deref() == Some("custom_message")
+            && entry.custom_type.as_deref() == Some("async-result")
+        {
+            return DiskTurnStatus::Pending;
+        }
+        if entry.kind.as_deref() == Some("message") {
+            if let Some(message) = entry.message {
+                return status_from_tail_message(&message);
+            }
+        }
+    }
+    DiskTurnStatus::Unknown
+}
+
 #[derive(Debug, Deserialize)]
 struct TailEntry {
     #[serde(rename = "type")]
     kind: Option<String>,
+    #[serde(rename = "customType")]
+    custom_type: Option<String>,
     message: Option<TailMessage>,
 }
 
@@ -246,6 +420,199 @@ mod tests {
         )
     }
 
+    fn custom_async_result(job_id: &str) -> String {
+        serde_json::json!({
+            "type": "custom_message",
+            "customType": "async-result",
+            "content": "done",
+            "details": {"jobs": [{"jobId": job_id, "type": "task"}]}
+        })
+        .to_string()
+    }
+
+    fn assistant_stop() -> String {
+        msg(
+            "assistant",
+            r#","stopReason":"stop","content":[{"type":"text","text":"waiting"}]"#,
+        )
+    }
+
+    fn task_progress(jobs: &[(&str, &str)]) -> String {
+        let progress: Vec<Value> = jobs
+            .iter()
+            .map(|(id, status)| serde_json::json!({"id": id, "status": status}))
+            .collect();
+        serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolName": "task",
+                "details": {"progress": progress}
+            }
+        })
+        .to_string()
+    }
+
+    fn hub_jobs(jobs: &[(&str, &str)]) -> String {
+        let jobs: Vec<Value> = jobs
+            .iter()
+            .map(|(id, status)| serde_json::json!({"id": id, "status": status}))
+            .collect();
+        serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolName": "hub",
+                "details": {"jobs": jobs}
+            }
+        })
+        .to_string()
+    }
+
+    fn append_lines(path: &Path, lines: &[&str]) {
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
+
+    #[test]
+    fn yielded_parent_stays_busy_while_task_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let task = task_progress(&[("reviewer", "pending")]);
+        let stopped = assistant_stop();
+        write_session(&path, &[task.as_str(), stopped.as_str()]);
+
+        let mut tracker = SessionActivityTracker::default();
+        assert!(tracker.busy("session", true, true, Some(&path)));
+    }
+
+    #[test]
+    fn async_result_clears_the_matching_task_after_final_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let task = task_progress(&[("reviewer", "running")]);
+        let stopped = assistant_stop();
+        write_session(&path, &[task.as_str(), stopped.as_str()]);
+        let mut tracker = SessionActivityTracker::default();
+        assert!(tracker.busy("session", true, true, Some(&path)));
+
+        let result = custom_async_result("reviewer");
+        append_lines(&path, &[result.as_str(), stopped.as_str()]);
+        assert!(!tracker.busy("session", true, true, Some(&path)));
+    }
+
+    #[test]
+    fn parallel_tasks_stay_busy_until_every_task_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let task = task_progress(&[("one", "pending"), ("two", "running")]);
+        let stopped = assistant_stop();
+        write_session(&path, &[task.as_str(), stopped.as_str()]);
+        let mut tracker = SessionActivityTracker::default();
+        assert!(tracker.busy("session", true, true, Some(&path)));
+
+        let one = custom_async_result("one");
+        append_lines(&path, &[one.as_str(), stopped.as_str()]);
+        assert!(tracker.busy("session", true, true, Some(&path)));
+
+        let two = custom_async_result("two");
+        append_lines(&path, &[two.as_str(), stopped.as_str()]);
+        assert!(!tracker.busy("session", true, true, Some(&path)));
+    }
+
+    #[test]
+    fn hub_terminal_states_clear_jobs() {
+        for terminal in ["completed", "failed", "aborted", "cancelled"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("t.jsonl");
+            let task = task_progress(&[("worker", "running")]);
+            let stopped = assistant_stop();
+            write_session(&path, &[task.as_str(), stopped.as_str()]);
+            let mut tracker = SessionActivityTracker::default();
+            assert!(tracker.busy("session", true, true, Some(&path)));
+
+            let hub = hub_jobs(&[("worker", terminal)]);
+            append_lines(&path, &[hub.as_str(), stopped.as_str()]);
+            assert!(
+                !tracker.busy("session", true, true, Some(&path)),
+                "terminal state {terminal} must clear the job"
+            );
+        }
+    }
+
+    #[test]
+    fn synchronous_completed_task_never_becomes_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let task = task_progress(&[("inline", "completed")]);
+        let stopped = assistant_stop();
+        write_session(&path, &[task.as_str(), stopped.as_str()]);
+
+        let mut tracker = SessionActivityTracker::default();
+        assert!(!tracker.busy("session", true, true, Some(&path)));
+    }
+
+    #[test]
+    fn tracker_waits_for_a_complete_appended_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let stopped = assistant_stop();
+        write_session(&path, &[stopped.as_str()]);
+        let mut tracker = SessionActivityTracker::default();
+        assert!(!tracker.busy("session", true, true, Some(&path)));
+
+        let task = task_progress(&[("reviewer", "pending")]);
+        let split = task.len() / 2;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(task[..split].as_bytes()).unwrap();
+        drop(file);
+        assert!(!tracker.busy("session", true, true, Some(&path)));
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(task[split..].as_bytes()).unwrap();
+        writeln!(file).unwrap();
+        writeln!(file, "{stopped}").unwrap();
+        drop(file);
+        assert!(tracker.busy("session", true, true, Some(&path)));
+    }
+
+    #[test]
+    fn tracker_rebuilds_after_file_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let task = task_progress(&[("reviewer", "pending")]);
+        let stopped = assistant_stop();
+        write_session(&path, &[task.as_str(), stopped.as_str()]);
+        let mut tracker = SessionActivityTracker::default();
+        assert!(tracker.busy("session", true, true, Some(&path)));
+
+        write_session(&path, &[stopped.as_str()]);
+        assert!(!tracker.busy("session", true, true, Some(&path)));
+    }
+
+    #[test]
+    fn malformed_and_unknown_events_preserve_confirmed_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let task = task_progress(&[("reviewer", "pending")]);
+        let stopped = assistant_stop();
+        write_session(&path, &[task.as_str(), stopped.as_str()]);
+        let mut tracker = SessionActivityTracker::default();
+        assert!(tracker.busy("session", true, true, Some(&path)));
+
+        let unknown = task_progress(&[("reviewer", "paused")]);
+        append_lines(&path, &["{broken", unknown.as_str(), stopped.as_str()]);
+        assert!(tracker.busy("session", true, true, Some(&path)));
+    }
+
     #[test]
     fn pending_user_is_busy_when_live() {
         let dir = tempfile::tempdir().unwrap();
@@ -255,9 +622,10 @@ mod tests {
             &[msg("user", r#","content":"still waiting""#).as_str()],
         );
         assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Pending);
-        assert!(agent_turn_busy(true, true, Some(&path)));
-        assert!(!agent_turn_busy(false, false, Some(&path)));
-        assert!(!agent_turn_busy(true, false, Some(&path))); // exited
+        let mut tracker = SessionActivityTracker::default();
+        assert!(tracker.busy("session", true, true, Some(&path)));
+        assert!(!tracker.busy("session", false, false, Some(&path)));
+        assert!(!tracker.busy("session", true, false, Some(&path))); // exited
     }
 
     #[test]
@@ -271,7 +639,21 @@ mod tests {
         );
         write_session(&path, &[user.as_str(), asst.as_str()]);
         assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Complete);
-        assert!(!agent_turn_busy(true, true, Some(&path)));
+        let mut tracker = SessionActivityTracker::default();
+        assert!(!tracker.busy("session", true, true, Some(&path)));
+    }
+
+    #[test]
+    fn async_result_is_pending_until_assistant_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let asst = msg(
+            "assistant",
+            r#","stopReason":"stop","content":[{"type":"text","text":"waiting"}]"#,
+        );
+        let delivered = custom_async_result("reviewer");
+        write_session(&path, &[asst.as_str(), delivered.as_str()]);
+        assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Pending);
     }
 
     #[test]
@@ -285,13 +667,12 @@ mod tests {
         );
         write_session(&path, &[user.as_str(), asst.as_str()]);
         assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Interrupted);
-        assert!(agent_turn_busy(true, true, Some(&path)));
+        let mut tracker = SessionActivityTracker::default();
+        assert!(tracker.busy("session", true, true, Some(&path)));
     }
 
     #[test]
     fn trailing_tool_results_all_answered_not_busy() {
-        // Regression: session 019fdb0c… ended with toolResults and never got a
-        // final assistant message — listing stays Interrupted, spinner must stop.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.jsonl");
         let user = msg("user", r#","content":"go""#);
@@ -312,7 +693,8 @@ mod tests {
             &[user.as_str(), asst.as_str(), r1.as_str(), r2.as_str()],
         );
         assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Interrupted);
-        assert!(!agent_turn_busy(true, true, Some(&path)));
+        let mut tracker = SessionActivityTracker::default();
+        assert!(!tracker.busy("s", true, true, Some(&path)));
     }
 
     #[test]
@@ -330,8 +712,10 @@ mod tests {
         );
         write_session(&path, &[user.as_str(), asst.as_str(), r1.as_str()]);
         assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Interrupted);
-        assert!(agent_turn_busy(true, true, Some(&path)));
+        let mut tracker = SessionActivityTracker::default();
+        assert!(tracker.busy("s", true, true, Some(&path)));
     }
+
 
     #[test]
     fn aborted_and_error_not_busy() {
@@ -341,7 +725,8 @@ mod tests {
         let asst = msg("assistant", r#","stopReason":"aborted","content":[]"#);
         write_session(&path, &[user.as_str(), asst.as_str()]);
         assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Aborted);
-        assert!(!agent_turn_busy(true, true, Some(&path)));
+        let mut tracker = SessionActivityTracker::default();
+        assert!(!tracker.busy("session", true, true, Some(&path)));
     }
 
     #[test]
@@ -350,8 +735,8 @@ mod tests {
         let path = dir.path().join("t.jsonl");
         write_session(&path, &[]);
         assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Unknown);
-        assert!(!agent_turn_busy(true, true, Some(&path)));
-        assert!(!agent_turn_busy(true, true, None));
+        let mut tracker = SessionActivityTracker::default();
+        assert!(!tracker.busy("session", true, true, Some(&path)));
+        assert!(!tracker.busy("session", true, true, None));
     }
-
 }

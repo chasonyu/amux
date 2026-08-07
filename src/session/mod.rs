@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use crate::config::AmuxConfig;
 use crate::lock::{check_occupiable, SessionLock};
 use crate::provider::omp::{parent_refers_to, OmpDiskSession, OmpProvider, TitleKind};
-use crate::provider::turn_status::agent_turn_busy;
+use crate::provider::turn_status::SessionActivityTracker;
 use crate::pty::PtySession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +48,7 @@ pub struct SessionSummary {
     pub size: u64,
     pub live: bool,
     pub status: SessionStatus,
-    /// Live PTY + JSONL tail says agent still owes work (pending/interrupted).
+    /// Live PTY whose main turn is active or whose background jobs are pending.
     pub agent_busy: bool,
     /// Turn finished while this row was not being viewed — clear on select/attach.
     pub unread: bool,
@@ -87,6 +87,7 @@ pub struct SessionSupervisor {
     known_disk_ids: HashMap<String, HashSet<String>>,
     /// `(old_id, new_id)` from the latest `list_for_workspace` pass.
     pending_rebinds: Vec<(String, String)>,
+    activity: SessionActivityTracker,
 }
 
 impl SessionSupervisor {
@@ -105,6 +106,7 @@ impl SessionSupervisor {
             ),
             known_disk_ids: HashMap::new(),
             pending_rebinds: Vec::new(),
+            activity: SessionActivityTracker::default(),
         }
     }
 
@@ -160,6 +162,7 @@ impl SessionSupervisor {
                 continue;
             };
             if let Some(mut entry) = self.live.remove(&syn_id) {
+                self.activity.forget(&syn_id);
                 // Release the old "new-N" lock and acquire under uuid.
                 drop(entry.lock.take());
                 let lock = SessionLock::try_acquire(&uuid).ok();
@@ -182,10 +185,10 @@ impl SessionSupervisor {
             }
         }
 
-        let mut out: Vec<SessionSummary> = disk
-            .into_iter()
-            .map(|d| self.to_summary(workspace_id, cwd, d))
-            .collect();
+        let mut out = Vec::with_capacity(disk.len());
+        for d in disk {
+            out.push(self.build_summary(workspace_id, cwd, d));
+        }
 
         // Include live "new" sessions not yet on disk list
         for (id, entry) in &self.live {
@@ -214,7 +217,7 @@ impl SessionSupervisor {
         Ok(out)
     }
 
-    fn to_summary(&self, workspace_id: &str, cwd: &Path, d: OmpDiskSession) -> SessionSummary {
+    fn build_summary(&mut self, workspace_id: &str, cwd: &Path, d: OmpDiskSession) -> SessionSummary {
         let live_entry = self.live.get(&d.id);
         let live = live_entry.is_some();
         let status = live_entry.map(|e| e.status).unwrap_or(SessionStatus::Disk);
@@ -222,11 +225,10 @@ impl SessionSupervisor {
         // while disk still only has Fallback id).
         let (title, title_kind) = match live_entry {
             Some(e) => (e.title.clone(), e.title_kind),
-            None => (d.title, d.title_kind),
+            None => (d.title.clone(), d.title_kind),
         };
         let path = d.path.clone();
-        let pty_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
-        let agent_busy = agent_turn_busy(live, pty_active, Some(path.as_path()));
+        let agent_busy = self.agent_busy(&d.id, live, status, Some(path.as_path()));
         SessionSummary {
             id: d.id,
             workspace_id: workspace_id.to_string(),
@@ -243,6 +245,17 @@ impl SessionSupervisor {
             agent_busy,
             unread: false,
         }
+    }
+
+    pub fn agent_busy(
+        &mut self,
+        session_id: &str,
+        live: bool,
+        status: SessionStatus,
+        path: Option<&Path>,
+    ) -> bool {
+        let pty_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
+        self.activity.busy(session_id, live, pty_active, path)
     }
 
     /// Apply a single-file title refresh into a live entry (if present).
@@ -331,6 +344,7 @@ impl SessionSupervisor {
         let Some(mut entry) = self.live.remove(old_id) else {
             return false;
         };
+        self.activity.forget(old_id);
         drop(entry.lock.take());
         entry.lock = SessionLock::try_acquire(&child.id).ok();
         apply_disk_title_to_live(&mut entry.title, &mut entry.title_kind, child);
@@ -464,6 +478,7 @@ impl SessionSupervisor {
     }
 
     pub fn close_session(&mut self, id: &str) {
+        self.activity.forget(id);
         if let Some(mut entry) = self.live.remove(id) {
             // Hold the flock until the kill ladder finishes so a
             // close→reattach race can't attach a new `omp --resume` while
@@ -481,6 +496,7 @@ impl SessionSupervisor {
     /// (and flock release) before returning. Use before deleting its jsonl so
     /// a dying omp cannot recreate the file under us.
     pub fn close_session_blocking(&mut self, id: &str) {
+        self.activity.forget(id);
         if let Some(mut entry) = self.live.remove(id) {
             entry.pty.kill_process_group();
             drop(entry.lock.take());
@@ -569,6 +585,9 @@ impl SessionSupervisor {
                 just_exited.push(id);
             }
         }
+        for id in &just_exited {
+            self.activity.forget(id);
+        }
         just_exited
     }
 
@@ -578,6 +597,7 @@ impl SessionSupervisor {
     pub fn shutdown_all_blocking(&mut self) {
         let ids: Vec<String> = self.live.keys().cloned().collect();
         for id in ids {
+            self.activity.forget(&id);
             if let Some(mut entry) = self.live.remove(&id) {
                 // Kill first, then release the flock — mirrors close_session's
                 // ordering so a close→reattach race can't attach a new omp --resume

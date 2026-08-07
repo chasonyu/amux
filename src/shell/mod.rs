@@ -49,10 +49,10 @@ use self::selection::{
     sgr_is_left_button, sgr_is_motion, text_from_snapshot, PaneSelection,
 };
 use crate::provider::{
-    agent_turn_busy, delete_session_with_artifacts, load, modified_files_scan, refresh_disk_session,
-    render_blocks, sanitize_session_title, write_session_title, DiffKind, DiffLine, FileOp,
-    ModifiedFilesScan, RenderedLine, SessionDirEvent, SessionDirWatcher, SpanStyle, TitleKind,
-    TranscriptBlock, TranscriptRole,
+    delete_session_with_artifacts, load, modified_files_scan, refresh_disk_session, render_blocks,
+    sanitize_session_title, write_session_title, DiffKind, DiffLine, FileOp, ModifiedFilesScan,
+    RenderedLine, SessionDirEvent, SessionDirWatcher, SpanStyle, TitleKind, TranscriptBlock,
+    TranscriptRole,
 };
 use crate::pty::MirroredModes;
 use crate::raw_input::{is_sgr_mouse, RawInputParser};
@@ -703,6 +703,15 @@ impl App {
                 continue;
             };
             let merged = self.sessions.apply_disk_title(&disk);
+            let activity = self
+                .session_list
+                .iter()
+                .find(|s| s.id == disk.id)
+                .map(|s| (s.id.clone(), s.live, s.status));
+            let busy = activity.as_ref().is_some_and(|(id, live, status)| {
+                self.sessions
+                    .agent_busy(id, *live, *status, Some(disk.path.as_path()))
+            });
             let mut finished: Option<String> = None;
             if let Some(s) = self.session_list.iter_mut().find(|s| s.id == disk.id) {
                 let (title, title_kind) = merged.unwrap_or_else(|| {
@@ -714,9 +723,6 @@ impl App {
                 s.mtime = disk.mtime;
                 s.size = disk.size;
                 s.path = Some(disk.path.clone());
-                let pty_active =
-                    matches!(s.status, SessionStatus::Starting | SessionStatus::Running);
-                let busy = agent_turn_busy(s.live, pty_active, Some(disk.path.as_path()));
                 if s.agent_busy && !busy {
                     finished = Some(s.id.clone());
                 }
@@ -761,12 +767,18 @@ impl App {
                 break;
             }
             let merged = self.sessions.apply_disk_title(&disk);
+            let activity = self
+                .session_list
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| (s.id.clone(), s.live, s.status));
+            let busy = activity.as_ref().is_some_and(|(session_id, live, status)| {
+                self.sessions
+                    .agent_busy(session_id, *live, *status, Some(disk.path.as_path()))
+            });
             let mut finished: Option<String> = None;
             if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
                 let is_fork = disk.parent_session.is_some();
-                let pty_active =
-                    matches!(s.status, SessionStatus::Starting | SessionStatus::Running);
-                let busy = agent_turn_busy(s.live, pty_active, Some(disk.path.as_path()));
                 let (title, title_kind) = merged.unwrap_or_else(|| {
                     (disk.title.clone(), disk.title_kind)
                 });
@@ -2162,13 +2174,13 @@ impl App {
                 self.session_list.iter().find(|s| s.id == *id).cloned()
             });
         let focused = self.focus == Focus::Agent;
-        let title = match view.as_ref() {
-            Some(s) => {
-                let name = s.title.as_str();
-                let short = if name.chars().count() > 36 {
-                    format!("{}…", name.chars().take(35).collect::<String>())
+        // Top chrome shows session id for triage; status bar shows the name.
+        let title = match view.as_ref().map(|s| s.id.as_str()) {
+            Some(id) => {
+                let short = if id.len() > 36 {
+                    format!("{}…", &id[..35])
                 } else {
-                    name.to_string()
+                    id.to_string()
                 };
                 format!(" Agent · {short} ")
             }
