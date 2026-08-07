@@ -702,11 +702,14 @@ impl App {
             let Some(disk) = refresh_disk_session(path) else {
                 continue;
             };
-            self.sessions.apply_disk_title(&disk);
+            let merged = self.sessions.apply_disk_title(&disk);
             let mut finished: Option<String> = None;
             if let Some(s) = self.session_list.iter_mut().find(|s| s.id == disk.id) {
-                s.title = disk.title.clone();
-                s.title_kind = disk.title_kind;
+                let (title, title_kind) = merged.unwrap_or_else(|| {
+                    (disk.title.clone(), disk.title_kind)
+                });
+                s.title = title;
+                s.title_kind = title_kind;
                 s.is_fork = disk.parent_session.is_some();
                 s.mtime = disk.mtime;
                 s.size = disk.size;
@@ -757,15 +760,18 @@ impl App {
                 need_full = true;
                 break;
             }
-            self.sessions.apply_disk_title(&disk);
+            let merged = self.sessions.apply_disk_title(&disk);
             let mut finished: Option<String> = None;
             if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
                 let is_fork = disk.parent_session.is_some();
                 let pty_active =
                     matches!(s.status, SessionStatus::Starting | SessionStatus::Running);
                 let busy = agent_turn_busy(s.live, pty_active, Some(disk.path.as_path()));
-                if s.title != disk.title
-                    || s.title_kind != disk.title_kind
+                let (title, title_kind) = merged.unwrap_or_else(|| {
+                    (disk.title.clone(), disk.title_kind)
+                });
+                if s.title != title
+                    || s.title_kind != title_kind
                     || s.is_fork != is_fork
                     || s.agent_busy != busy
                 {
@@ -774,8 +780,8 @@ impl App {
                 if s.agent_busy && !busy {
                     finished = Some(s.id.clone());
                 }
-                s.title = disk.title;
-                s.title_kind = disk.title_kind;
+                s.title = title;
+                s.title_kind = title_kind;
                 s.is_fork = is_fork;
                 s.mtime = disk.mtime;
                 s.size = disk.size;
@@ -1725,8 +1731,14 @@ impl App {
                 }
             }
         }
-        // Prefer focused session for selection (covers fork rebind + attach).
-        let prefer = self.focused_session_id.clone().or(select_id);
+        // Nav/File/Modal browse must keep the user's selected row across
+        // watch/poll refreshes. Agent focus keeps the attached session
+        // highlighted. Fork rebind already remaps both ids above.
+        let prefer = prefer_session_selection(
+            self.focus,
+            self.focused_session_id.clone(),
+            select_id,
+        );
         if let Some(id) = prefer {
             if let Some(i) = self.session_list.iter().position(|s| s.id == id) {
                 self.selected_session = i;
@@ -2150,12 +2162,13 @@ impl App {
                 self.session_list.iter().find(|s| s.id == *id).cloned()
             });
         let focused = self.focus == Focus::Agent;
-        let title = match view.as_ref().map(|s| s.id.as_str()) {
-            Some(id) => {
-                let short = if id.len() > 36 {
-                    format!("{}…", &id[..35])
+        let title = match view.as_ref() {
+            Some(s) => {
+                let name = s.title.as_str();
+                let short = if name.chars().count() > 36 {
+                    format!("{}…", name.chars().take(35).collect::<String>())
                 } else {
-                    id.to_string()
+                    name.to_string()
                 };
                 format!(" Agent · {short} ")
             }
@@ -4011,9 +4024,24 @@ fn poll_fd(fd: i32, timeout: Duration) -> Result<bool> {
     }
 }
 
+
+/// Sidebar selection after a session-list refresh.
+/// Nav/File/Modal keep the browsed row; Agent keeps the attached session.
+fn prefer_session_selection(
+    focus: Focus,
+    focused_session_id: Option<String>,
+    select_id: Option<String>,
+) -> Option<String> {
+    if focus == Focus::Agent {
+        focused_session_id.or(select_id)
+    } else {
+        select_id.or(focused_session_id)
+    }
+}
+
 #[cfg(test)]
 mod escape_key_tests {
-    use super::{confirm_key, is_escape_key, ConfirmResult};
+    use super::{confirm_key, is_escape_key, prefer_session_selection, ConfirmResult, Focus};
 
     #[test]
     fn escape_key_bare_and_kitty() {
@@ -4033,6 +4061,26 @@ mod escape_key_tests {
         assert_eq!(confirm_key(b"\x1b[27u", &mut yes), ConfirmResult::No);
         assert_eq!(confirm_key(b"\x1b", &mut yes), ConfirmResult::No);
         assert_eq!(confirm_key(b"n", &mut yes), ConfirmResult::No);
+    }
+
+    #[test]
+    fn nav_refresh_keeps_browsed_selection() {
+        let prefer = prefer_session_selection(
+            Focus::Nav,
+            Some("new-1".into()),
+            Some("old-session".into()),
+        );
+        assert_eq!(prefer.as_deref(), Some("old-session"));
+    }
+
+    #[test]
+    fn agent_refresh_keeps_focused_selection() {
+        let prefer = prefer_session_selection(
+            Focus::Agent,
+            Some("new-1".into()),
+            Some("old-session".into()),
+        );
+        assert_eq!(prefer.as_deref(), Some("new-1"));
     }
 }
 

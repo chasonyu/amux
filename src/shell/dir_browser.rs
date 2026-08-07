@@ -32,6 +32,8 @@ pub struct DirBrowser {
     pub path_input: LineInput,
     pub tab_completions: Vec<String>,
     pub tab_index: usize,
+    /// When true, include directories whose names start with `.`.
+    pub show_hidden: bool,
     pub error: Option<String>,
 }
 
@@ -56,8 +58,9 @@ impl DirBrowser {
             .filter(|p| p.is_dir())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("/"));
+        let show_hidden = false;
         Self {
-            entries: browser_entries(&cwd),
+            entries: browser_entries(&cwd, show_hidden),
             cwd,
             selected: 0,
             filter: LineInput::new(),
@@ -66,6 +69,7 @@ impl DirBrowser {
             path_input: LineInput::new(),
             tab_completions: Vec::new(),
             tab_index: 0,
+            show_hidden,
             error: None,
         }
     }
@@ -88,7 +92,7 @@ impl DirBrowser {
     }
 
     fn refresh_completions(&mut self) {
-        self.tab_completions = path_completion_candidates(&self.path_input.text);
+        self.tab_completions = path_completion_candidates(&self.path_input.text, self.show_hidden);
         self.tab_index = 0;
     }
 
@@ -146,6 +150,17 @@ impl DirBrowser {
                     path,
                     browser: self,
                 }
+            }
+            b"." => {
+                self.show_hidden = !self.show_hidden;
+                self.entries = browser_entries(&self.cwd, self.show_hidden);
+                let len = self.visible().len();
+                if len == 0 {
+                    self.selected = 0;
+                } else if self.selected >= len {
+                    self.selected = len - 1;
+                }
+                BrowserResult::Continue(self)
             }
             b"\r" | b"\n" | b"l" | b"\x1b[C" => self.open_selected(),
             _ => BrowserResult::Continue(self),
@@ -267,7 +282,7 @@ impl DirBrowser {
             return BrowserResult::Continue(self);
         };
         self.cwd = entry.path;
-        self.entries = browser_entries(&self.cwd);
+        self.entries = browser_entries(&self.cwd, self.show_hidden);
         self.selected = 0;
         self.filter.clear();
         self.searching = false;
@@ -275,7 +290,7 @@ impl DirBrowser {
     }
 }
 
-pub fn browser_entries(dir: &Path) -> Vec<DirEntry> {
+pub fn browser_entries(dir: &Path, show_hidden: bool) -> Vec<DirEntry> {
     let mut entries = std::fs::read_dir(dir)
         .ok()
         .into_iter()
@@ -287,7 +302,7 @@ pub fn browser_entries(dir: &Path) -> Vec<DirEntry> {
                 return None;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
+            if !show_hidden && name.starts_with('.') {
                 return None;
             }
             let is_git_repo = path.join(".git").exists();
@@ -321,7 +336,7 @@ pub fn browser_entries(dir: &Path) -> Vec<DirEntry> {
     entries
 }
 
-fn path_completion_candidates(input: &str) -> Vec<String> {
+fn path_completion_candidates(input: &str, show_hidden: bool) -> Vec<String> {
     let input_path = PathBuf::from(input);
     let (search_dir, prefix) = if input_path.is_dir() && input.ends_with('/') {
         (input_path, String::new())
@@ -345,7 +360,7 @@ fn path_completion_candidates(input: &str) -> Vec<String> {
         .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
         .filter(|e| {
             let name = e.file_name().to_string_lossy().to_lowercase();
-            !name.starts_with('.') && name.starts_with(&prefix_lower)
+            (show_hidden || !name.starts_with('.')) && name.starts_with(&prefix_lower)
         })
         .map(|e| {
             let mut full = search_dir.join(e.file_name()).to_string_lossy().into_owned();
@@ -535,12 +550,30 @@ pub fn draw_dir_browser(f: &mut Frame, area: Rect, theme: &Theme, browser: &DirB
         bottom_spans.extend(footer_hint(theme, "/", "search"));
         bottom_spans.extend(footer_hint(theme, "Enter/l", "open"));
         bottom_spans.extend(footer_hint(theme, "g", "go to"));
+        bottom_spans.extend(footer_hint(
+            theme,
+            ".",
+            if browser.show_hidden {
+                "hide ."
+            } else {
+                "show ."
+            },
+        ));
         bottom_spans.extend(footer_hint(theme, "Esc", "cancel"));
     } else {
         bottom_spans.extend(footer_hint(theme, "/", "search"));
         bottom_spans.extend(footer_hint(theme, "Enter/l", "open"));
         bottom_spans.extend(footer_hint(theme, "o", "add current"));
         bottom_spans.extend(footer_hint(theme, "g", "go to"));
+        bottom_spans.extend(footer_hint(
+            theme,
+            ".",
+            if browser.show_hidden {
+                "hide ."
+            } else {
+                "show ."
+            },
+        ));
         bottom_spans.extend(footer_hint(theme, "Esc", "cancel"));
     }
 

@@ -136,36 +136,37 @@ impl SessionSupervisor {
         // Reconcile "new-N" live sessions: if omp has written a session file
         // with its own uuid, adopt that uuid as the live key so the sidebar
         // shows one entry, not two, and occupied-detection works. (§5.2)
-        let synthetic_ids: Vec<String> = self
+        let mut synthetics: Vec<(String, DateTime<Utc>)> = self
             .live
             .iter()
-            .filter(|(id, e)| {
-                id.starts_with("new-")
-                    && e.workspace_id == workspace_id
-            })
-            .map(|(id, _)| id.clone())
+            .filter(|(id, e)| id.starts_with("new-") && e.workspace_id == workspace_id)
+            .map(|(id, e)| (id.clone(), e.spawned_at))
             .collect();
-        for syn_id in &synthetic_ids {
-            let spawned_at = self.live.get(syn_id).map(|e| e.spawned_at);
-            let Some(spawned_at) = spawned_at else { continue };
-            // Find a disk session whose uuid is NOT already live and whose
-            // mtime is at or after spawn time.
-            let matched = disk.iter().find(|d| {
-                !self.live.contains_key(&d.id) && d.mtime >= spawned_at
-            });
-            if let Some(d) = matched {
-                let uuid = d.id.clone();
-                if let Some(mut entry) = self.live.remove(syn_id) {
-                    // Release the old "new-N" lock and acquire under uuid.
-                    drop(entry.lock.take());
-                    let lock = SessionLock::try_acquire(&uuid).ok();
-                    entry.lock = lock;
-                    entry.title = d.title.clone();
-                    entry.title_kind = d.title_kind;
-                    self.live.insert(uuid.clone(), entry);
-                    self.pending_rebinds
-                        .push((syn_id.clone(), uuid));
-                }
+        // Oldest spawn first so concurrent news pair stably with disk mtimes.
+        synthetics.sort_by_key(|(_, spawned_at)| *spawned_at);
+        let mut claimed_disk: HashSet<String> = HashSet::new();
+        for (syn_id, spawned_at) in synthetics {
+            let matched_id = pick_synthetic_disk_match(
+                &disk,
+                spawned_at,
+                |id| self.live.contains_key(id) || claimed_disk.contains(id),
+            )
+            .map(|d| d.id.clone());
+            let Some(uuid) = matched_id else {
+                continue;
+            };
+            claimed_disk.insert(uuid.clone());
+            let Some(d) = disk.iter().find(|d| d.id == uuid) else {
+                continue;
+            };
+            if let Some(mut entry) = self.live.remove(&syn_id) {
+                // Release the old "new-N" lock and acquire under uuid.
+                drop(entry.lock.take());
+                let lock = SessionLock::try_acquire(&uuid).ok();
+                entry.lock = lock;
+                apply_disk_title_to_live(&mut entry.title, &mut entry.title_kind, d);
+                self.live.insert(uuid.clone(), entry);
+                self.pending_rebinds.push((syn_id, uuid));
             }
         }
 
@@ -174,10 +175,10 @@ impl SessionSupervisor {
         self.reconcile_fork_rebinds(workspace_id, &disk);
 
         // Keep live titles in sync with disk (LLM /rename / firstMessage).
+        // Never let a half-written jsonl Fallback(id) clobber "New session".
         for d in &disk {
             if let Some(entry) = self.live.get_mut(&d.id) {
-                entry.title = d.title.clone();
-                entry.title_kind = d.title_kind;
+                apply_disk_title_to_live(&mut entry.title, &mut entry.title_kind, d);
             }
         }
 
@@ -214,11 +215,14 @@ impl SessionSupervisor {
     }
 
     fn to_summary(&self, workspace_id: &str, cwd: &Path, d: OmpDiskSession) -> SessionSummary {
-        let live = self.live.contains_key(&d.id);
-        let status = if let Some(e) = self.live.get(&d.id) {
-            e.status
-        } else {
-            SessionStatus::Disk
+        let live_entry = self.live.get(&d.id);
+        let live = live_entry.is_some();
+        let status = live_entry.map(|e| e.status).unwrap_or(SessionStatus::Disk);
+        // Live title is authoritative after merge policy (keeps "New session"
+        // while disk still only has Fallback id).
+        let (title, title_kind) = match live_entry {
+            Some(e) => (e.title.clone(), e.title_kind),
+            None => (d.title, d.title_kind),
         };
         let path = d.path.clone();
         let pty_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
@@ -227,8 +231,8 @@ impl SessionSupervisor {
             id: d.id,
             workspace_id: workspace_id.to_string(),
             provider: "omp",
-            title: d.title,
-            title_kind: d.title_kind,
+            title,
+            title_kind,
             is_fork: d.parent_session.is_some(),
             path: Some(path),
             cwd: cwd.to_path_buf(),
@@ -242,11 +246,11 @@ impl SessionSupervisor {
     }
 
     /// Apply a single-file title refresh into a live entry (if present).
-    pub fn apply_disk_title(&mut self, d: &OmpDiskSession) {
-        if let Some(entry) = self.live.get_mut(&d.id) {
-            entry.title = d.title.clone();
-            entry.title_kind = d.title_kind;
-        }
+    /// Returns the effective live title after merge policy.
+    pub fn apply_disk_title(&mut self, d: &OmpDiskSession) -> Option<(String, TitleKind)> {
+        let entry = self.live.get_mut(&d.id)?;
+        apply_disk_title_to_live(&mut entry.title, &mut entry.title_kind, d);
+        Some((entry.title.clone(), entry.title_kind))
     }
 
     /// Optimistic sidebar title after Nav rename / `/rename` inject.
@@ -329,8 +333,7 @@ impl SessionSupervisor {
         };
         drop(entry.lock.take());
         entry.lock = SessionLock::try_acquire(&child.id).ok();
-        entry.title = child.title.clone();
-        entry.title_kind = child.title_kind;
+        apply_disk_title_to_live(&mut entry.title, &mut entry.title_kind, child);
         self.live.insert(child.id.clone(), entry);
         self.pending_rebinds
             .push((old_id.to_string(), child.id.clone()));
@@ -591,6 +594,155 @@ impl SessionSupervisor {
         for handle in std::mem::take(&mut self.kill_threads) {
             let _ = handle.join();
         }
+    }
+}
+
+
+/// Small mtime skew tolerance: jsonl may be stamped slightly before our spawn clock.
+const SYNTHETIC_MTIME_SKEW_MS: i64 = 500;
+
+/// Match a brand-new (non-fork) disk session to a synthetic live spawn.
+/// Prefers the oldest eligible file at/after spawn time so concurrent `new-N`
+/// entries pair stably instead of both claiming the newest uuid.
+fn pick_synthetic_disk_match<'a, F>(
+    disk: &'a [OmpDiskSession],
+    spawned_at: DateTime<Utc>,
+    is_taken: F,
+) -> Option<&'a OmpDiskSession>
+where
+    F: Fn(&str) -> bool,
+{
+    let skew = chrono::Duration::milliseconds(SYNTHETIC_MTIME_SKEW_MS);
+    disk.iter()
+        .filter(|d| {
+            !is_taken(&d.id)
+                && d.parent_session.is_none()
+                && d.mtime + skew >= spawned_at
+        })
+        .min_by_key(|d| d.mtime)
+}
+
+/// Merge disk title into a live entry without downgrading.
+/// Official wins over everything; Provisional wins over Fallback; Fallback(id)
+/// must not replace live `New session` while omp jsonl is still half-written.
+fn merge_disk_title(
+    live_title: &str,
+    live_kind: TitleKind,
+    disk_title: &str,
+    disk_kind: TitleKind,
+) -> Option<(String, TitleKind)> {
+    // Priority: Official > Provisional > live "New session" > Fallback(id).
+    match (live_kind, disk_kind) {
+        (_, TitleKind::Official) => {
+            if live_title == disk_title && live_kind == TitleKind::Official {
+                None
+            } else {
+                Some((disk_title.to_string(), disk_kind))
+            }
+        }
+        (TitleKind::Official, _) => None,
+        (_, TitleKind::Provisional) => {
+            if live_title == disk_title && live_kind == TitleKind::Provisional {
+                None
+            } else {
+                Some((disk_title.to_string(), disk_kind))
+            }
+        }
+        (TitleKind::Provisional, TitleKind::Fallback) => None,
+        (TitleKind::Fallback, TitleKind::Fallback) => {
+            if live_title == "New session" || live_title == disk_title {
+                None
+            } else {
+                Some((disk_title.to_string(), disk_kind))
+            }
+        }
+    }
+}
+
+fn apply_disk_title_to_live(title: &mut String, kind: &mut TitleKind, disk: &OmpDiskSession) {
+    if let Some((next_title, next_kind)) =
+        merge_disk_title(title, *kind, &disk.title, disk.title_kind)
+    {
+        *title = next_title;
+        *kind = next_kind;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn disk(id: &str, title: &str, kind: TitleKind, mtime: DateTime<Utc>, parent: Option<&str>) -> OmpDiskSession {
+        OmpDiskSession {
+            id: id.into(),
+            title: title.into(),
+            title_kind: kind,
+            parent_session: parent.map(|s| s.into()),
+            path: PathBuf::from(format!("/tmp/{id}.jsonl")),
+            mtime,
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn merge_keeps_new_session_over_fallback_id() {
+        assert_eq!(
+            merge_disk_title("New session", TitleKind::Fallback, "abc-uuid", TitleKind::Fallback),
+            None
+        );
+    }
+
+    #[test]
+    fn merge_upgrades_to_provisional_and_official() {
+        assert_eq!(
+            merge_disk_title("New session", TitleKind::Fallback, "hello", TitleKind::Provisional),
+            Some(("hello".into(), TitleKind::Provisional))
+        );
+        assert_eq!(
+            merge_disk_title("hello", TitleKind::Provisional, "Renamed", TitleKind::Official),
+            Some(("Renamed".into(), TitleKind::Official))
+        );
+    }
+
+    #[test]
+    fn merge_does_not_downgrade_official() {
+        assert_eq!(
+            merge_disk_title("Renamed", TitleKind::Official, "abc-uuid", TitleKind::Fallback),
+            None
+        );
+        assert_eq!(
+            merge_disk_title("Renamed", TitleKind::Official, "older msg", TitleKind::Provisional),
+            None
+        );
+    }
+
+    #[test]
+    fn synthetic_match_skips_fork_and_pairs_oldest() {
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+        let t2 = t0 + chrono::Duration::seconds(2);
+        let sessions = vec![
+            disk("fork", "f", TitleKind::Fallback, t2, Some("parent")),
+            disk("new-b", "b", TitleKind::Fallback, t2, None),
+            disk("new-a", "a", TitleKind::Fallback, t1, None),
+        ];
+        let first = pick_synthetic_disk_match(&sessions, t0, |_| false).unwrap();
+        assert_eq!(first.id, "new-a");
+        let second = pick_synthetic_disk_match(&sessions, t0, |id| id == "new-a").unwrap();
+        assert_eq!(second.id, "new-b");
+        assert!(pick_synthetic_disk_match(&sessions, t0, |id| id == "new-a" || id == "new-b").is_none());
+    }
+
+    #[test]
+    fn synthetic_match_allows_small_mtime_skew() {
+        let spawned = Utc::now();
+        let slightly_earlier = spawned - chrono::Duration::milliseconds(200);
+        let sessions = vec![disk("id1", "id1", TitleKind::Fallback, slightly_earlier, None)];
+        assert_eq!(
+            pick_synthetic_disk_match(&sessions, spawned, |_| false).map(|d| d.id.as_str()),
+            Some("id1")
+        );
     }
 }
 

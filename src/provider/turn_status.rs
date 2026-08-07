@@ -1,10 +1,15 @@
 //! Derive whether an omp agent turn is still in progress from the JSONL tail.
 //!
-//! Mirrors oh-my-pi `session-listing.ts` `deriveSessionStatus` / `statusFromTailMessage`.
-//! amux only surfaces a spinner for **live** sessions when the tail says the
-//! agent still owes work (`pending` / `interrupted`). `unknown` never lights
-//! the spinner (prefer false idle over false busy).
+//! Listing status mirrors oh-my-pi `session-listing.ts`
+//! `deriveSessionStatus` / `statusFromTailMessage`.
+//!
+//! Sidebar spinner (`agent_turn_busy`) is stricter than listing status:
+//! trailing `toolResult` only counts as busy while the previous assistant
+//! turn still has unanswered `toolCall`s. Once every tool has returned, we
+//! stop the wave even if omp never wrote a final assistant message (stuck /
+//! abandoned mid-turn) — prefer brief false-idle over infinite false-busy.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -31,7 +36,9 @@ pub enum DiskTurnStatus {
 /// Strict gates (avoid “idle shown as busy” / “busy shown as idle” where we can):
 /// - `live && pty_active` (Starting/Running); Exited/Disk never spin
 /// - JSONL path required (no guess for pre-file synthetic sessions)
-/// - Only `pending` (trailing user) or `interrupted` (mid tool loop)
+/// - `pending` (trailing user) → busy
+/// - `interrupted` with unanswered toolCalls (assistant tail or partial toolResults) → busy
+/// - trailing `toolResult` with all toolCalls answered → **not** busy
 /// - `unknown` / `complete` / `aborted` / `error` → no spinner
 pub fn agent_turn_busy(live: bool, pty_active: bool, path: Option<&Path>) -> bool {
     if !live || !pty_active {
@@ -40,42 +47,32 @@ pub fn agent_turn_busy(live: bool, pty_active: bool, path: Option<&Path>) -> boo
     let Some(path) = path else {
         return false;
     };
-    matches!(
-        derive_disk_turn_status(path),
-        DiskTurnStatus::Pending | DiskTurnStatus::Interrupted
-    )
+    match derive_disk_turn_status(path) {
+        DiskTurnStatus::Pending => true,
+        DiskTurnStatus::Interrupted => tools_still_in_flight(path),
+        _ => false,
+    }
 }
 
 pub fn derive_disk_turn_status(path: &Path) -> DiskTurnStatus {
-    let Ok(mut f) = File::open(path) else {
+    let Some(message) = last_tail_message(path) else {
         return DiskTurnStatus::Unknown;
     };
-    let Ok(meta) = f.metadata() else {
-        return DiskTurnStatus::Unknown;
-    };
-    let len = meta.len();
-    if len == 0 {
-        return DiskTurnStatus::Unknown;
-    }
-    let start = len.saturating_sub(TAIL_BYTES);
-    if f.seek(SeekFrom::Start(start)).is_err() {
-        return DiskTurnStatus::Unknown;
-    }
-    let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() {
-        return DiskTurnStatus::Unknown;
-    }
-    // When we started mid-file, the first line may be a partial fragment —
-    // skip it (same as omp walking lines and ignoring non-`{` starts).
-    let text = String::from_utf8_lossy(&buf);
-    let lines: Vec<&str> = if start > 0 {
-        let mut it = text.split('\n');
-        let _ = it.next(); // drop leading partial
-        it.collect()
-    } else {
-        text.split('\n').collect()
-    };
+    status_from_tail_message(&message)
+}
 
+/// Whether the latest tool loop still has unanswered `toolCall`s.
+///
+/// - Trailing assistant with `toolCall` → true (tools not finished writing results)
+/// - Trailing `toolResult`s → true only if the preceding assistant still has
+///   a `toolCall` id without a matching result
+/// - Otherwise → false (including “all tools returned, waiting on model”)
+fn tools_still_in_flight(path: &Path) -> bool {
+    let Ok(lines) = read_tail_lines(path) else {
+        // Fail closed on I/O: keep prior Interrupted semantics (busy).
+        return true;
+    };
+    let mut seen_results: HashSet<String> = HashSet::new();
     for line in lines.iter().rev() {
         if line.is_empty() || !line.as_bytes().starts_with(b"{") {
             continue;
@@ -89,9 +86,66 @@ pub fn derive_disk_turn_status(path: &Path) -> DiskTurnStatus {
         let Some(message) = entry.message else {
             continue;
         };
-        return status_from_tail_message(&message);
+        match message.role.as_deref() {
+            Some("toolResult") => {
+                if let Some(id) = message.tool_call_id.filter(|s| !s.is_empty()) {
+                    seen_results.insert(id);
+                }
+            }
+            Some("assistant") => {
+                let calls = tool_call_ids(message.content.as_ref());
+                if calls.is_empty() {
+                    // Text-only / aborted assistant — not a live tool loop.
+                    return false;
+                }
+                return calls.iter().any(|id| !seen_results.contains(id));
+            }
+            Some("user") => return false,
+            _ => continue,
+        }
     }
-    DiskTurnStatus::Unknown
+    // Interrupted (e.g. length truncate) without a resolvable tool loop —
+    // keep spinning rather than falsely clearing a mid-flight turn.
+    true
+}
+
+fn last_tail_message(path: &Path) -> Option<TailMessage> {
+    let lines = read_tail_lines(path).ok()?;
+    for line in lines.iter().rev() {
+        if line.is_empty() || !line.as_bytes().starts_with(b"{") {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<TailEntry>(line) else {
+            continue;
+        };
+        if entry.kind.as_deref() != Some("message") {
+            continue;
+        }
+        if let Some(message) = entry.message {
+            return Some(message);
+        }
+    }
+    None
+}
+
+fn read_tail_lines(path: &Path) -> std::io::Result<Vec<String>> {
+    let mut f = File::open(path)?;
+    let meta = f.metadata()?;
+    let len = meta.len();
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let start = len.saturating_sub(TAIL_BYTES);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+    // When we started mid-file, the first line may be a partial fragment.
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    Ok(lines)
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +161,8 @@ struct TailMessage {
     #[serde(rename = "stopReason")]
     stop_reason: Option<String>,
     content: Option<Value>,
+    #[serde(rename = "toolCallId")]
+    tool_call_id: Option<String>,
 }
 
 fn status_from_tail_message(message: &TailMessage) -> DiskTurnStatus {
@@ -130,14 +186,25 @@ fn status_from_tail_message(message: &TailMessage) -> DiskTurnStatus {
 }
 
 fn content_has_tool_call(content: Option<&Value>) -> bool {
+    !tool_call_ids(content).is_empty()
+}
+
+fn tool_call_ids(content: Option<&Value>) -> Vec<String> {
     let Some(Value::Array(parts)) = content else {
-        return false;
+        return Vec::new();
     };
-    parts.iter().any(|p| {
-        p.get("type")
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t == "toolCall")
-    })
+    parts
+        .iter()
+        .filter_map(|p| {
+            if p.get("type").and_then(|t| t.as_str()) != Some("toolCall") {
+                return None;
+            }
+            p.get("id")
+                .and_then(|id| id.as_str())
+                .filter(|id| !id.is_empty())
+                .map(|id| id.to_string())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -217,6 +284,51 @@ mod tests {
             r#","stopReason":"toolUse","content":[{"type":"toolCall","id":"t1","name":"read","arguments":{}}]"#,
         );
         write_session(&path, &[user.as_str(), asst.as_str()]);
+        assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Interrupted);
+        assert!(agent_turn_busy(true, true, Some(&path)));
+    }
+
+    #[test]
+    fn trailing_tool_results_all_answered_not_busy() {
+        // Regression: session 019fdb0c… ended with toolResults and never got a
+        // final assistant message — listing stays Interrupted, spinner must stop.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let user = msg("user", r#","content":"go""#);
+        let asst = msg(
+            "assistant",
+            r#","stopReason":"toolUse","content":[{"type":"toolCall","id":"t1","name":"read","arguments":{}},{"type":"toolCall","id":"t2","name":"bash","arguments":{}}]"#,
+        );
+        let r1 = msg(
+            "toolResult",
+            r#","toolCallId":"t1","toolName":"read","content":[{"type":"text","text":"ok"}]"#,
+        );
+        let r2 = msg(
+            "toolResult",
+            r#","toolCallId":"t2","toolName":"bash","content":[{"type":"text","text":"ok"}]"#,
+        );
+        write_session(
+            &path,
+            &[user.as_str(), asst.as_str(), r1.as_str(), r2.as_str()],
+        );
+        assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Interrupted);
+        assert!(!agent_turn_busy(true, true, Some(&path)));
+    }
+
+    #[test]
+    fn trailing_tool_results_partial_still_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let user = msg("user", r#","content":"go""#);
+        let asst = msg(
+            "assistant",
+            r#","stopReason":"toolUse","content":[{"type":"toolCall","id":"t1","name":"read","arguments":{}},{"type":"toolCall","id":"t2","name":"bash","arguments":{}}]"#,
+        );
+        let r1 = msg(
+            "toolResult",
+            r#","toolCallId":"t1","toolName":"read","content":[{"type":"text","text":"ok"}]"#,
+        );
+        write_session(&path, &[user.as_str(), asst.as_str(), r1.as_str()]);
         assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Interrupted);
         assert!(agent_turn_busy(true, true, Some(&path)));
     }
