@@ -3,3 +3,6 @@
 .amux-local/
 *.log
 .superpowers/
+node_modules/
+vendor/
+*.tar.gz
