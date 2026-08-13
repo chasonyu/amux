@@ -138,16 +138,16 @@ amux is a dual-pane TUI built with [ratatui](https://ratatui.rs/) and [crossterm
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│ amux (Rust TUI)                                           │
+│ amux (Rust TUI)                                            │
 │                                                            │
 │  ┌──────────────┐   ┌──────────────────────────────────┐   │
-│  │ Sidebar      │   │ PtySurface (focused session)    │   │
+│  │ Sidebar      │   │ PtySurface (focused session)     │   │
 │  │ workspaces   │   │ VT grid ←→ PTY master            │   │
-│  │ sessions     │   │ child: omp / omp --resume …     │   │
+│  │ sessions     │   │ child: omp / omp --resume …      │   │
 │  └──────┬───────┘   └──────────────▲───────────────────┘   │
 │         │                          │                       │
 │         ▼                          │                       │
-│  SessionSupervisor ──── Provider registry (v1: OmpProvider) │
+│  SessionSupervisor ──── Provider registry (v1:OmpProvider) │
 │  lazy spawn · multi-session       spawn / resume / list    │
 └────────────────────────────────────────────────────────────┘
 ```

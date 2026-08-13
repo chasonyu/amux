@@ -13,9 +13,11 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
-/// omp `SESSION_LIST_SUFFIX_BYTES` — if the final message exceeds this window,
-/// status is [`DiskTurnStatus::Unknown`] rather than a wrong classification.
+/// omp `SESSION_LIST_SUFFIX_BYTES` — preferred status window.
 const TAIL_BYTES: u64 = 32_768;
+/// When the preferred window lands inside an oversized trailing line, expand up
+/// to this cap so a complete >32KB message can still be classified.
+const MAX_TAIL_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskTurnStatus {
@@ -97,10 +99,14 @@ impl SessionActivityTracker {
             self.forget(session_id);
             return false;
         };
+        // Fail-closed on Unknown while the PTY is alive: an unreadable tail
+        // (oversized line, partial write) must not look "finished".
         let turn_busy = match derive_disk_turn_status(path) {
-            DiskTurnStatus::Pending => true,
-            DiskTurnStatus::Interrupted => tools_still_in_flight(path),
-            _ => false,
+            DiskTurnStatus::Pending | DiskTurnStatus::Unknown => true,
+            DiskTurnStatus::Interrupted => interrupted_turn_busy(path),
+            DiskTurnStatus::Complete
+            | DiskTurnStatus::Aborted
+            | DiskTurnStatus::Error => false,
         };
         let async_busy = self.refresh(session_id, path);
         turn_busy || async_busy
@@ -236,8 +242,14 @@ fn apply_job_status(id: Option<&str>, status: Option<&str>, jobs: &mut HashSet<S
     }
 }
 
-/// Whether the latest tool loop still has unanswered `toolCall`s.
-fn tools_still_in_flight(path: &Path) -> bool {
+/// Whether an `Interrupted` tail still means the agent is working.
+///
+/// Agent styles differ after tools return:
+/// - `stopReason=toolUse`/`length`: model still owes a follow-up → keep waving
+///   through the thinking gap after every `toolCall` is answered.
+/// - `stopReason=stop`/`end_turn` (etc.) with tools: turn is done once results
+///   land → stop waving (common for Codex-style sessions).
+fn interrupted_turn_busy(path: &Path) -> bool {
     let Ok(lines) = read_tail_lines(path) else {
         return true;
     };
@@ -266,13 +278,68 @@ fn tools_still_in_flight(path: &Path) -> bool {
                 if calls.is_empty() {
                     return false;
                 }
-                return calls.iter().any(|id| !seen_results.contains(id));
+                if calls.iter().any(|id| !seen_results.contains(id)) {
+                    return true;
+                }
+                // All answered: only `toolUse`/`length` imply another assistant turn.
+                return matches!(
+                    message.stop_reason.as_deref(),
+                    Some("toolUse" | "length")
+                );
             }
             Some("user") => return false,
             _ => continue,
         }
     }
+    // Tool-result-only window with no assistant in range — fail-closed.
     true
+}
+
+fn lines_from_suffix(buf: &[u8], started_mid_file: bool) -> Vec<String> {
+    let text = String::from_utf8_lossy(buf);
+    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+    if started_mid_file && !lines.is_empty() {
+        // Drop the leading partial fragment from the byte-window cut.
+        lines.remove(0);
+    }
+    lines
+}
+
+fn suffix_has_json_line(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .any(|line| !line.is_empty() && line.as_bytes().starts_with(b"{"))
+}
+
+/// Prefer expanding when the 32KB tip is only `toolResult`s (or unreadable),
+/// so we can see the parent assistant's `stopReason` / toolCall ids.
+fn suffix_needs_more_context(lines: &[String]) -> bool {
+    if !suffix_has_json_line(lines) {
+        return true;
+    }
+    let mut saw_tool_result = false;
+    for line in lines.iter().rev() {
+        if line.is_empty() || !line.as_bytes().starts_with(b"{") {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<TailEntry>(line) else {
+            continue;
+        };
+        if entry.kind.as_deref() != Some("message") {
+            continue;
+        }
+        let Some(message) = entry.message.as_ref() else {
+            continue;
+        };
+        match message.role.as_deref() {
+            Some("toolResult") => {
+                saw_tool_result = true;
+            }
+            Some("assistant" | "user") => return false,
+            _ => continue,
+        }
+    }
+    saw_tool_result
 }
 
 fn read_tail_lines(path: &Path) -> std::io::Result<Vec<String>> {
@@ -282,14 +349,21 @@ fn read_tail_lines(path: &Path) -> std::io::Result<Vec<String>> {
     if len == 0 {
         return Ok(Vec::new());
     }
+
     let start = len.saturating_sub(TAIL_BYTES);
     f.seek(SeekFrom::Start(start))?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
-    if start > 0 && !lines.is_empty() {
-        lines.remove(0);
+    let mut lines = lines_from_suffix(&buf, start > 0);
+
+    // Preferred 32KB window can land inside one oversized trailing message, or
+    // contain only toolResults while the parent assistant sits further back.
+    if suffix_needs_more_context(&lines) && start > 0 {
+        let expand_start = len.saturating_sub(MAX_TAIL_BYTES);
+        f.seek(SeekFrom::Start(expand_start))?;
+        buf.clear();
+        f.read_to_end(&mut buf)?;
+        lines = lines_from_suffix(&buf, expand_start > 0);
     }
     Ok(lines)
 }
@@ -672,13 +746,42 @@ mod tests {
     }
 
     #[test]
-    fn trailing_tool_results_all_answered_not_busy() {
+    fn trailing_tool_results_all_answered_still_busy_after_tool_use() {
+        // toolUse → tools returned → model still owes a follow-up assistant turn.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.jsonl");
         let user = msg("user", r#","content":"go""#);
         let asst = msg(
             "assistant",
             r#","stopReason":"toolUse","content":[{"type":"toolCall","id":"t1","name":"read","arguments":{}},{"type":"toolCall","id":"t2","name":"bash","arguments":{}}]"#,
+        );
+        let r1 = msg(
+            "toolResult",
+            r#","toolCallId":"t1","toolName":"read","content":[{"type":"text","text":"ok"}]"#,
+        );
+        let r2 = msg(
+            "toolResult",
+            r#","toolCallId":"t2","toolName":"bash","content":[{"type":"text","text":"ok"}]"#,
+        );
+        write_session(
+            &path,
+            &[user.as_str(), asst.as_str(), r1.as_str(), r2.as_str()],
+        );
+        assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Interrupted);
+        let mut tracker = SessionActivityTracker::default();
+        assert!(tracker.busy("s", true, true, Some(&path)));
+    }
+
+    #[test]
+    fn trailing_tool_results_after_stop_not_busy() {
+        // Codex-style: assistant stopReason=stop can still include toolCalls.
+        // Once every tool returns, the turn is finished — do not keep waving.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let user = msg("user", r#","content":"go""#);
+        let asst = msg(
+            "assistant",
+            r#","stopReason":"stop","content":[{"type":"toolCall","id":"t1","name":"read","arguments":{}},{"type":"toolCall","id":"t2","name":"bash","arguments":{}}]"#,
         );
         let r1 = msg(
             "toolResult",
@@ -730,13 +833,33 @@ mod tests {
     }
 
     #[test]
-    fn unknown_never_spins() {
+    fn unknown_spins_while_pty_active() {
+        // Unreadable / empty tail must not look finished while the child lives.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.jsonl");
         write_session(&path, &[]);
         assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Unknown);
         let mut tracker = SessionActivityTracker::default();
-        assert!(!tracker.busy("session", true, true, Some(&path)));
+        assert!(tracker.busy("session", true, true, Some(&path)));
         assert!(!tracker.busy("session", true, true, None));
+        assert!(!tracker.busy("session", true, false, Some(&path)));
+    }
+
+    #[test]
+    fn oversized_trailing_complete_line_still_classifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let user = msg("user", r#","content":"go""#);
+        let huge = "x".repeat(40_000);
+        let asst = msg(
+            "assistant",
+            &format!(
+                r#","stopReason":"stop","content":[{{"type":"text","text":"{huge}"}}]"#
+            ),
+        );
+        write_session(&path, &[user.as_str(), asst.as_str()]);
+        assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Complete);
+        let mut tracker = SessionActivityTracker::default();
+        assert!(!tracker.busy("session", true, true, Some(&path)));
     }
 }
