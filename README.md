@@ -57,13 +57,6 @@ npm install -g @chasonyu/amux
 The postinstall script auto-downloads the matching prebuilt binary for your
 platform/arch (Linux x64/arm64, macOS x64/arm64) from GitHub Releases.
 
-> Behind a corporate npm proxy registry (e.g. an internal mirror)? Point
-> install at the public registry so the package and its postinstall download
-> resolve correctly:
-> ```bash
-> npm install -g @chasonyu/amux --registry https://registry.npmjs.org/
-> ```
-
 **From source:**
 
 ```bash
