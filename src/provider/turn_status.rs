@@ -101,19 +101,43 @@ impl SessionActivityTracker {
         };
         // Fail-closed on Unknown while the PTY is alive: an unreadable tail
         // (oversized line, partial write) must not look "finished".
-        let turn_busy = match derive_disk_turn_status(path) {
+        let turn_status = derive_disk_turn_status(path);
+        let turn_busy = match turn_status {
             DiskTurnStatus::Pending | DiskTurnStatus::Unknown => true,
             DiskTurnStatus::Interrupted => interrupted_turn_busy(path),
             DiskTurnStatus::Complete
             | DiskTurnStatus::Aborted
             | DiskTurnStatus::Error => false,
         };
+        // Always advance the async ledger first so offsets stay correct even
+        // when a terminal main-turn status drops outstanding jobs below.
         let async_busy = self.refresh(session_id, path);
+
+        // Aborted/Error means the main turn was cancelled/failed. Do not keep
+        // the sidebar wave on orphaned task/hub jobs that never got an
+        // async-result (common after interrupt + sighup/resume).
+        //
+        // Intentionally NOT applied to Complete: a normal stop/yield must keep
+        // waving while background subagents are still outstanding.
+        if matches!(
+            turn_status,
+            DiskTurnStatus::Aborted | DiskTurnStatus::Error
+        ) {
+            self.clear_outstanding_jobs(session_id);
+            return false;
+        }
+
         turn_busy || async_busy
     }
 
     pub fn forget(&mut self, session_id: &str) {
         self.sessions.remove(session_id);
+    }
+
+    fn clear_outstanding_jobs(&mut self, session_id: &str) {
+        if let Some(tracked) = self.sessions.get_mut(session_id) {
+            tracked.file.outstanding_jobs.clear();
+        }
     }
 
     fn refresh(&mut self, session_id: &str, path: &Path) -> bool {
@@ -183,6 +207,16 @@ fn refresh_activity_file(path: &Path, state: &mut ActivityFileState) {
 }
 
 fn apply_activity_entry(entry: &ActivityEntry<'_>, jobs: &mut HashSet<String>) {
+    // omp writes session_exit as type:"custom" (sometimes custom_message).
+    // After crash/sighup the ledger can still list running jobs; once the
+    // session has exited those jobs must not keep the wave forever across
+    // --resume (fresh tracker re-reads the whole file).
+    if entry.custom_type == Some("session_exit")
+        && matches!(entry.kind, Some("custom" | "custom_message"))
+    {
+        jobs.clear();
+        return;
+    }
     if entry.kind == Some("custom_message") && entry.custom_type == Some("async-result") {
         if let Some(results) = entry
             .details
@@ -828,6 +862,92 @@ mod tests {
         let asst = msg("assistant", r#","stopReason":"aborted","content":[]"#);
         write_session(&path, &[user.as_str(), asst.as_str()]);
         assert_eq!(derive_disk_turn_status(&path), DiskTurnStatus::Aborted);
+        let mut tracker = SessionActivityTracker::default();
+        assert!(!tracker.busy("session", true, true, Some(&path)));
+    }
+
+    fn session_exit_line(kind: &str) -> String {
+        serde_json::json!({
+            "type": kind,
+            "customType": "session_exit",
+            "data": {"reason": "sighup", "kind": "signal"}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn aborted_clears_orphaned_running_jobs() {
+        // Regression: task/hub left "running", then assistant aborted with no
+        // async-result. Wave must stop; stop/yield+pending must still wave.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let task = task_progress(&[("frontend", "pending")]);
+        let hub = hub_jobs(&[("frontend", "running")]);
+        let aborted = msg("assistant", r#","stopReason":"aborted","content":[]"#);
+        write_session(&path, &[task.as_str(), hub.as_str(), aborted.as_str()]);
+
+        let mut tracker = SessionActivityTracker::default();
+        assert!(
+            !tracker.busy("session", true, true, Some(&path)),
+            "aborted must not keep waving on orphan jobs"
+        );
+
+        // A later Complete+pending (normal yield) on a fresh tracker still waves.
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = dir2.path().join("t.jsonl");
+        let pending = task_progress(&[("reviewer", "pending")]);
+        let stopped = assistant_stop();
+        write_session(&path2, &[pending.as_str(), stopped.as_str()]);
+        let mut tracker2 = SessionActivityTracker::default();
+        assert!(
+            tracker2.busy("session", true, true, Some(&path2)),
+            "stop/yield + pending must still wave"
+        );
+    }
+
+    #[test]
+    fn error_clears_orphaned_running_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let task = task_progress(&[("worker", "running")]);
+        let errored = msg("assistant", r#","stopReason":"error","content":[]"#);
+        write_session(&path, &[task.as_str(), errored.as_str()]);
+        let mut tracker = SessionActivityTracker::default();
+        assert!(!tracker.busy("session", true, true, Some(&path)));
+    }
+
+    #[test]
+    fn session_exit_clears_orphaned_jobs_even_after_complete_yield() {
+        // sighup while yielded waiting for a subagent: on --resume the tracker
+        // re-reads the file and must not resurrect the pre-exit running job.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let task = task_progress(&[("worker", "running")]);
+        let stopped = assistant_stop();
+        let exit = session_exit_line("custom");
+        write_session(&path, &[task.as_str(), stopped.as_str(), exit.as_str()]);
+
+        let mut tracker = SessionActivityTracker::default();
+        assert!(
+            !tracker.busy("session", true, true, Some(&path)),
+            "session_exit must clear orphan jobs across resume"
+        );
+
+        // After exit, a new pending task should wave again.
+        let again = task_progress(&[("worker2", "pending")]);
+        let stopped2 = assistant_stop();
+        append_lines(&path, &[again.as_str(), stopped2.as_str()]);
+        assert!(tracker.busy("session", true, true, Some(&path)));
+    }
+
+    #[test]
+    fn session_exit_custom_message_alias_also_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let task = task_progress(&[("worker", "running")]);
+        let stopped = assistant_stop();
+        let exit = session_exit_line("custom_message");
+        write_session(&path, &[task.as_str(), stopped.as_str(), exit.as_str()]);
         let mut tracker = SessionActivityTracker::default();
         assert!(!tracker.busy("session", true, true, Some(&path)));
     }
