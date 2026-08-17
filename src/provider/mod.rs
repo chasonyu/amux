@@ -1,17 +1,20 @@
+pub mod api;
 pub mod omp;
+pub mod registry;
 pub mod transcript;
 pub mod turn_status;
 pub mod watch;
 
-pub use omp::{
-    delete_session_with_artifacts, encode_cwd_key, list_omp_sessions, parent_refers_to,
-    refresh_disk_session, sanitize_session_title, session_artifacts_dir, write_session_title,
-    OmpDiskSession, OmpProvider, TitleKind,
+#[cfg(test)]
+pub mod test_support;
+
+pub use api::{
+    AgentProvider, LiveRenameAction, ModifiedFilesScanner, ProviderCapabilities, ProviderChange,
+    ProviderId, ProviderSession, SessionKey, SpawnSpec, TitleSource,
 };
-pub use turn_status::{derive_disk_turn_status, DiskTurnStatus, SessionActivityTracker};
+pub use omp::OmpProvider;
+pub use registry::ProviderRegistry;
 pub use transcript::{
-    load, modified_files_scan, render_blocks, DiffKind, DiffLine, FileOp, ModifiedFile,
-    ModifiedFilesScan, RenderedLine, RenderedSpan, SpanStyle, ToolKind, ToolStatus,
-    TranscriptBlock, TranscriptRole,
+    render_blocks, DiffKind, DiffLine, FileOp, ModifiedFile, RenderedLine, RenderedSpan, SpanStyle,
+    ToolKind, ToolStatus, TranscriptBlock, TranscriptRole,
 };
-pub use watch::{SessionDirEvent, SessionDirWatcher};

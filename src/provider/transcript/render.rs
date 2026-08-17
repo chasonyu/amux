@@ -107,7 +107,11 @@ impl RenderedLine {
 }
 
 /// Render neutral blocks to display lines for the Agent transcript preview.
-pub fn render_blocks(blocks: &[TranscriptBlock], width: usize, _theme: &Theme) -> Vec<RenderedLine> {
+pub fn render_blocks(
+    blocks: &[TranscriptBlock],
+    width: usize,
+    _theme: &Theme,
+) -> Vec<RenderedLine> {
     let width = width.max(1);
     let mut out = Vec::new();
     let mut first_visible = true;
@@ -159,7 +163,11 @@ fn render_one(block: &TranscriptBlock, width: usize, out: &mut Vec<RenderedLine>
             // Full pane width (no left pad) so table borders can use the same
             // column budget the preview actually paints into.
             let md_lines = render_markdown(text, width);
-            out.extend(RenderedLine::from_md(TranscriptRole::Assistant, md_lines, false));
+            out.extend(RenderedLine::from_md(
+                TranscriptRole::Assistant,
+                md_lines,
+                false,
+            ));
         }
         TranscriptBlock::Thinking { summary } => {
             let raw = if summary.trim().is_empty() {
@@ -178,7 +186,10 @@ fn render_one(block: &TranscriptBlock, width: usize, out: &mut Vec<RenderedLine>
         TranscriptBlock::ReadGroup { paths, status } => {
             render_read_group(paths, *status, out);
         }
-        TranscriptBlock::Custom { custom_type, content } => {
+        TranscriptBlock::Custom {
+            custom_type,
+            content,
+        } => {
             render_custom(custom_type, content, width, out);
         }
         TranscriptBlock::Tool {
@@ -189,10 +200,24 @@ fn render_one(block: &TranscriptBlock, width: usize, out: &mut Vec<RenderedLine>
             kind,
             ..
         } => match kind {
-            ToolKind::Bash => render_bash_eval(true, title, *status, arg_preview, output_preview, width, out),
-            ToolKind::Eval => {
-                render_bash_eval(false, title, *status, arg_preview, output_preview, width, out)
-            }
+            ToolKind::Bash => render_bash_eval(
+                true,
+                title,
+                *status,
+                arg_preview,
+                output_preview,
+                width,
+                out,
+            ),
+            ToolKind::Eval => render_bash_eval(
+                false,
+                title,
+                *status,
+                arg_preview,
+                output_preview,
+                width,
+                out,
+            ),
             ToolKind::Default | ToolKind::Read => {
                 render_default_tool(title, *status, arg_preview, output_preview, out)
             }
@@ -472,7 +497,11 @@ fn render_custom(custom_type: &str, content: &str, width: usize, out: &mut Vec<R
     });
     if !content.trim().is_empty() {
         let md_lines = render_markdown(content, md_width);
-        out.extend(RenderedLine::from_md(TranscriptRole::Custom, md_lines, true));
+        out.extend(RenderedLine::from_md(
+            TranscriptRole::Custom,
+            md_lines,
+            true,
+        ));
     }
 }
 
@@ -580,7 +609,12 @@ mod tests {
             .filter(|l| l.role == TranscriptRole::User)
             .collect();
         // paddingY=1 → blank + content + blank
-        assert_eq!(user.len(), 3, "{:?}", user.iter().map(|l| line_text(l)).collect::<Vec<_>>());
+        assert_eq!(
+            user.len(),
+            3,
+            "{:?}",
+            user.iter().map(|l| line_text(l)).collect::<Vec<_>>()
+        );
         assert!(user[0].is_blank());
         assert!(line_text(user[1]).contains("hi"));
         assert!(user[2].is_blank());
@@ -650,7 +684,7 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_real_omp_session_preview() {
-        use super::super::load;
+        use super::super::omp;
 
         let root = dirs_home_omp_sessions();
         let Some(path) = find_newest_jsonl(&root) else {
@@ -658,7 +692,7 @@ mod tests {
             return;
         };
         let theme = Theme::dark();
-        let blocks = load("omp", &path);
+        let blocks = omp::load(&path);
         let lines = render_blocks(&blocks, 80, &theme);
         println!(
             "=== {} ({} blocks, {} lines) ===",

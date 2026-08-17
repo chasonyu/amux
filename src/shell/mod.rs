@@ -5,15 +5,14 @@ pub mod mode_mirror;
 mod selection;
 mod text_input;
 
-use std::collections::{HashMap, HashSet};
+use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use chrono::{DateTime, Utc};
-
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, Show};
@@ -33,45 +32,42 @@ use ratatui::{Frame, Terminal};
 use signal_hook::consts::signal::{SIGHUP, SIGWINCH};
 use signal_hook::flag as signal_flag;
 
+use self::selection::{
+    grid_from_plain_lines, osc52_clipboard_set, paint_selection_overlay, sgr_has_meta,
+    sgr_is_left_button, sgr_is_motion, text_from_snapshot, PaneSelection,
+};
 use crate::appearance::{
     host_surface_from_osc11_seq, is_da1_reply, is_inside_tmux, osc11_query, parse_mode2031_dsr,
     probe_host_surface, wrap_tmux_passthrough, Appearance, HostSurface,
 };
 use crate::config::{AmuxConfig, AppearanceMode};
-use crate::theme::Theme;
 use crate::escape::{EscapeAction, EscapeToggle};
 use crate::mouse::{
     list_row_index, point_in_rect, sgr_has_shift, sgr_is_button_press, sgr_is_release,
     sgr_wheel_delta, translate_sgr_mouse_clipped,
 };
-use self::selection::{
-    grid_from_plain_lines, osc52_clipboard_set, paint_selection_overlay, sgr_has_meta,
-    sgr_is_left_button, sgr_is_motion, text_from_snapshot, PaneSelection,
-};
+use crate::provider::api::{LiveRenameAction, SessionKey};
 use crate::provider::{
-    delete_session_with_artifacts, load, modified_files_scan, refresh_disk_session, render_blocks,
-    sanitize_session_title, write_session_title, DiffKind, DiffLine, FileOp, ModifiedFilesScan,
-    RenderedLine, SessionDirEvent, SessionDirWatcher, SpanStyle, TitleKind, TranscriptBlock,
-    TranscriptRole,
+    render_blocks, DiffKind, DiffLine, FileOp, ModifiedFilesScanner, RenderedLine, SpanStyle,
+    TitleSource, TranscriptBlock, TranscriptRole,
 };
 use crate::pty::MirroredModes;
 use crate::raw_input::{is_sgr_mouse, RawInputParser};
-use crate::session::{SessionStatus, SessionSummary, SessionSupervisor};
+use crate::session::{SessionStatus, SessionSummary, SessionSummaryChange, SessionSupervisor};
+use crate::theme::Theme;
 use crate::workspace::WorkspaceStore;
 
-const TITLE_WATCH_DEBOUNCE: Duration = Duration::from_millis(80);
 /// Wheel notches → emulator history lines.
 const WHEEL_SCROLL_LINES: i32 = 2;
-const TITLE_FALLBACK_POLL: Duration = Duration::from_secs(3);
 /// Session-list double-click → attach (same as Enter).
 const SESSION_DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// AgentMode intercept: Ctrl+N (0x0e) — toggle the modified-files panel.
-/// Verified unbound by omp/pi-tui (not in app/tui keybindings, not reserved,
-/// not an ASCII collider). See keybindings audit in design notes.
 const CTRL_N_BYTE: u8 = 0x0e;
 
 use self::dir_browser::{draw_dir_browser, BrowserResult, DirBrowser};
-use self::mode_mirror::{apply_host_modes, apply_nav_host_modes, baseline_host_modes, KbNegotiated};
+use self::mode_mirror::{
+    apply_host_modes, apply_nav_host_modes, baseline_host_modes, KbNegotiated,
+};
 use self::text_input::LineInput;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,16 +97,14 @@ enum Modal {
     },
     /// Delete omp session jsonl + sibling artifacts dir.
     ConfirmDeleteSession {
-        id: String,
+        key: SessionKey,
         title: String,
-        path: PathBuf,
         live: bool,
         yes_focused: bool,
     },
     /// Rename session (Nav `r`): live → inject `/rename`; disk → title slot.
     RenameSession {
-        id: String,
-        path: Option<PathBuf>,
+        key: SessionKey,
         live: bool,
         input: LineInput,
         error: Option<String>,
@@ -134,11 +128,11 @@ pub struct App {
     selected_ws: usize,
     selected_session: usize,
     session_list: Vec<SessionSummary>,
-    focused_session_id: Option<String>,
+    focused_session: Option<SessionKey>,
     modal: Option<Modal>,
     status: String,
-    drop_notice: Option<String>,
     total_dropped_keys: u64,
+    drop_notice: Option<String>,
     total_write_drops: u64,
     escape: EscapeToggle,
     parser: RawInputParser,
@@ -166,23 +160,16 @@ pub struct App {
     /// Last translated mouse position (1-based, pane-local) and button
     /// (Cb low bits) for a faithful leave-AgentMode release. (§4.2.2)
     last_mouse_cb: u8,
-    last_mouse_x: u16,
     last_mouse_y: u16,
+    last_mouse_x: u16,
+    anim_t0: Instant,
+    /// Cached transcript blocks for the selected non-live session's preview.
+    transcript_cache: Option<TranscriptCache>,
     theme: Theme,
     /// Host terminal appearance classification (dark/light).
     appearance: Appearance,
     /// Probed (or fallback) FG/BG shared with live PTY OSC replies + default paint.
     host_surface: HostSurface,
-    /// Watches current workspace omp session dir for title / list changes.
-    session_watch: SessionDirWatcher,
-    dirty_session_paths: HashSet<PathBuf>,
-    title_debounce_until: Option<Instant>,
-    title_need_rescan: bool,
-    last_title_poll: Instant,
-    /// Epoch for braille busy-spinner animation in the session list.
-    anim_t0: Instant,
-    /// Cached JSONL transcript for the Agent preview pane.
-    transcript_cache: Option<TranscriptCache>,
     /// Host-owned pane-clipped text selection (Agent content area).
     pane_sel: Option<PaneSelection>,
     /// Last session-row click for double-click attach `(when, index)`.
@@ -203,7 +190,7 @@ pub struct App {
 }
 
 struct TranscriptCache {
-    path: PathBuf,
+    key: SessionKey,
     mtime: DateTime<Utc>,
     size: u64,
     blocks: Vec<TranscriptBlock>,
@@ -211,21 +198,18 @@ struct TranscriptCache {
     scroll_from_bottom: usize,
 }
 
-
 /// Incremental modified-files aggregate for one session file, plus the
-/// rendered diff of the focused row. Both are keyed so a repaint reuses them:
-/// the panel redraws on every PTY burst, and neither re-scanning the JSONL nor
-/// re-diffing per frame would be affordable.
+/// rendered diff of the focused row. Both are keyed so a repaint reuses them.
 struct ModifiedFilesCache {
-    path: PathBuf,
+    key: SessionKey,
     /// Size at the last poll; unchanged size means nothing was appended.
     size: u64,
-    scan: ModifiedFilesScan,
+    scan: Box<dyn ModifiedFilesScanner>,
     diff: Option<DiffCache>,
 }
 
 struct DiffCache {
-    /// [`ModifiedFilesScan::version`] the lines were rendered from.
+    /// Scanner version the lines were rendered from.
     version: u64,
     file_index: usize,
     lines: Vec<DiffLine>,
@@ -247,7 +231,7 @@ impl App {
             selected_ws: 0,
             selected_session: 0,
             session_list: Vec::new(),
-            focused_session_id: None,
+            focused_session: None,
             modal: None,
             status: String::new(),
             // Overwritten in `run` after OSC 11 probe (before raw/alt screen).
@@ -276,11 +260,6 @@ impl App {
             last_mouse_cb: 0,
             last_mouse_x: 1,
             last_mouse_y: 1,
-            session_watch: SessionDirWatcher::spawn(),
-            dirty_session_paths: HashSet::new(),
-            title_debounce_until: None,
-            title_need_rescan: false,
-            last_title_poll: Instant::now(),
             anim_t0: Instant::now(),
             transcript_cache: None,
             pane_sel: None,
@@ -397,11 +376,7 @@ impl App {
         false
     }
 
-    fn run_inner(
-        &mut self,
-        stdout: &mut io::Stdout,
-        stdin_fd: i32,
-    ) -> Result<()> {
+    fn run_inner(&mut self, stdout: &mut io::Stdout, stdin_fd: i32) -> Result<()> {
         execute!(
             stdout,
             EnterAlternateScreen,
@@ -424,8 +399,14 @@ impl App {
         let mut terminal = Terminal::new(backend)?;
         signal_flag::register(SIGWINCH, Arc::clone(&self.winch))?;
         // Restore terminal on SIGINT/SIGTERM — never let signals bypass teardown.
-        signal_flag::register(signal_hook::consts::signal::SIGINT, Arc::clone(&self.interrupt))?;
-        signal_flag::register(signal_hook::consts::signal::SIGTERM, Arc::clone(&self.interrupt))?;
+        signal_flag::register(
+            signal_hook::consts::signal::SIGINT,
+            Arc::clone(&self.interrupt),
+        )?;
+        signal_flag::register(
+            signal_hook::consts::signal::SIGTERM,
+            Arc::clone(&self.interrupt),
+        )?;
         // SIGHUP (controlling terminal closed) must break into the normal
         // teardown path so the kill ladder runs and the terminal is restored
         // on every exit path. (§4.2.10)
@@ -517,26 +498,25 @@ impl App {
             if !just_exited.is_empty() {
                 // Drop busy wave immediately — do not wait for a full rescan.
                 let mut finished = Vec::new();
-                for id in &just_exited {
-                    if let Some(s) = self.session_list.iter_mut().find(|s| s.id == *id) {
+                for key in &just_exited {
+                    if let Some(s) = self.session_list.iter_mut().find(|s| s.key == *key) {
                         if s.agent_busy {
-                            finished.push(id.clone());
+                            finished.push(key.clone());
                         }
                         s.status = SessionStatus::Exited;
                         s.agent_busy = false;
                     }
                 }
-                for id in finished {
-                    self.mark_unread_if_not_watching(&id);
+                for key in finished {
+                    self.mark_unread_if_not_watching(&key);
                 }
             }
             if self.focus == Focus::Agent {
-                if let Some(id) = self.focused_session_id.clone() {
-                    if just_exited.iter().any(|e| e == &id) {
+                if let Some(key) = self.focused_session.clone() {
+                    if just_exited.iter().any(|e| e == &key) {
                         // Spec: child exit → drop to Nav so x / Enter work.
                         self.enter_nav()?;
-                        self.status =
-                            "Session exited — Enter re-attach · x close".into();
+                        self.status = "Session exited — Enter re-attach · x close".into();
                         self.refresh_sessions();
                     }
                 }
@@ -546,8 +526,8 @@ impl App {
 
             // Mode mirror for focused session
             if self.focus == Focus::Agent {
-                if let Some(id) = self.focused_session_id.clone() {
-                    if let Some(pty) = self.sessions.get(&id) {
+                if let Some(key) = self.focused_session.clone() {
+                    if let Some(pty) = self.sessions.get(&key) {
                         let modes = pty.mirrored_modes();
                         if modes != self.last_host_modes {
                             apply_host_modes(&mut io::stdout(), &modes)?;
@@ -561,7 +541,7 @@ impl App {
             // rest are dropped to keep background host_outbound bounded.
             // (§4.2.11.2 / PTY-15)
             let focused = if self.focus == Focus::Agent {
-                self.focused_session_id.as_deref()
+                self.focused_session.as_ref()
             } else {
                 None
             };
@@ -578,16 +558,15 @@ impl App {
             // silently multiplied. (§4.2.8)
             if self.focus == Focus::Agent {
                 let bp = self
-                    .focused_session_id
+                    .focused_session
                     .as_ref()
-                    .and_then(|id| self.sessions.get(id))
+                    .and_then(|key| self.sessions.get(key))
                     .map(|pty| pty.is_write_backpressured())
                     .unwrap_or(false);
                 if bp {
                     continue;
                 }
             }
-
 
             // Poll stdin with short timeout so UI stays responsive
             let timeout = self.next_timeout();
@@ -618,218 +597,79 @@ impl App {
     fn next_timeout(&self) -> Duration {
         let mut t = Duration::from_millis(33);
         if let Some(d) = self.escape.deadline() {
-            t = t.min(d.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)));
+            t = t.min(
+                d.saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1)),
+            );
         }
         if let Some(d) = self.esc_deadline {
-            t = t.min(d.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)));
+            t = t.min(
+                d.saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1)),
+            );
         }
-        if let Some(d) = self.title_debounce_until {
-            t = t.min(d.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)));
+        if let Some(d) = self.sessions.next_provider_deadline() {
+            t = t.min(
+                d.saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1)),
+            );
         }
         t
     }
 
-    fn ensure_session_watch(&mut self) {
-        let dir = self
-            .workspaces
-            .list()
-            .get(self.selected_ws)
-            .map(|ws| {
-                self.sessions
-                    .provider()
-                    .session_dir_for_cwd(Path::new(&ws.path))
-            });
-        self.session_watch.set_dir(dir);
-    }
-
     fn poll_session_titles(&mut self, now: Instant) {
-        for ev in self.session_watch.drain() {
-            match ev {
-                SessionDirEvent::Changed(p) | SessionDirEvent::Removed(p) => {
-                    self.dirty_session_paths.insert(p);
-                    self.title_debounce_until = Some(now + TITLE_WATCH_DEBOUNCE);
+        let changes = match self.sessions.poll_provider_changes(now) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for change in changes {
+            match change {
+                SessionSummaryChange::Upsert {
+                    summary,
+                    became_idle,
+                } => {
+                    if let Some(s) = self.session_list.iter_mut().find(|s| s.key == summary.key) {
+                        let was_unread = s.unread;
+                        *s = summary.clone();
+                        s.unread = was_unread;
+                        let watching = self.focus == Focus::Agent
+                            && self.focused_session.as_ref() == Some(&s.key);
+                        if became_idle && busy_to_idle_should_mark_unread(watching) {
+                            s.unread = true;
+                        }
+                    }
                 }
-                SessionDirEvent::Rescan => {
-                    self.title_need_rescan = true;
-                    self.title_debounce_until = Some(now + TITLE_WATCH_DEBOUNCE);
-                }
-            }
-        }
-
-        let debounce_due = self
-            .title_debounce_until
-            .map(|d| now >= d)
-            .unwrap_or(false);
-        if debounce_due {
-            self.title_debounce_until = None;
-            if self.title_need_rescan {
-                self.title_need_rescan = false;
-                self.dirty_session_paths.clear();
-                self.refresh_sessions();
-            } else if !self.dirty_session_paths.is_empty() {
-                let paths: Vec<PathBuf> = self.dirty_session_paths.drain().collect();
-                self.apply_session_file_changes(&paths);
-            }
-        }
-
-        if now.duration_since(self.last_title_poll) >= TITLE_FALLBACK_POLL {
-            self.last_title_poll = now;
-            self.fallback_poll_titles();
-        }
-    }
-
-    fn apply_session_file_changes(&mut self, paths: &[PathBuf]) {
-        let mut need_full = false;
-        for path in paths {
-            if !path.exists() {
-                need_full = true;
-                break;
-            }
-            let known = self
-                .session_list
-                .iter()
-                .any(|s| s.path.as_ref().is_some_and(|p| p == path));
-            if !known {
-                need_full = true;
-                break;
-            }
-        }
-        if need_full {
-            self.refresh_sessions();
-            return;
-        }
-        for path in paths {
-            let Some(disk) = refresh_disk_session(path) else {
-                continue;
-            };
-            let merged = self.sessions.apply_disk_title(&disk);
-            let activity = self
-                .session_list
-                .iter()
-                .find(|s| s.id == disk.id)
-                .map(|s| (s.id.clone(), s.live, s.status));
-            let busy = activity.as_ref().is_some_and(|(id, live, status)| {
-                self.sessions
-                    .agent_busy(id, *live, *status, Some(disk.path.as_path()))
-            });
-            let mut finished: Option<String> = None;
-            if let Some(s) = self.session_list.iter_mut().find(|s| s.id == disk.id) {
-                let (title, title_kind) = merged.unwrap_or_else(|| {
-                    (disk.title.clone(), disk.title_kind)
-                });
-                s.title = title;
-                s.title_kind = title_kind;
-                s.is_fork = disk.parent_session.is_some();
-                s.mtime = disk.mtime;
-                s.size = disk.size;
-                s.path = Some(disk.path.clone());
-                if s.agent_busy && !busy {
-                    finished = Some(s.id.clone());
-                }
-                s.agent_busy = busy;
-            }
-            if let Some(id) = finished {
-                self.mark_unread_if_not_watching(&id);
-            }
-        }
-    }
-
-    fn fallback_poll_titles(&mut self) {
-        let mut changed = false;
-        let mut need_full = false;
-        let snapshots: Vec<(String, Option<PathBuf>, DateTime<Utc>, u64)> = self
-            .session_list
-            .iter()
-            .map(|s| (s.id.clone(), s.path.clone(), s.mtime, s.size))
-            .collect();
-
-        for (id, path, mtime, size) in snapshots {
-            let Some(path) = path else {
-                // Synthetic live entry — full refresh may adopt uuid + title.
-                need_full = true;
-                break;
-            };
-            let Ok(meta) = std::fs::metadata(&path) else {
-                need_full = true;
-                break;
-            };
-            let new_mtime = DateTime::<Utc>::from(meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH));
-            let new_size = meta.len();
-            if new_mtime == mtime && new_size == size {
-                continue;
-            }
-            let Some(disk) = refresh_disk_session(&path) else {
-                need_full = true;
-                break;
-            };
-            if disk.id != id {
-                need_full = true;
-                break;
-            }
-            let merged = self.sessions.apply_disk_title(&disk);
-            let activity = self
-                .session_list
-                .iter()
-                .find(|s| s.id == id)
-                .map(|s| (s.id.clone(), s.live, s.status));
-            let busy = activity.as_ref().is_some_and(|(session_id, live, status)| {
-                self.sessions
-                    .agent_busy(session_id, *live, *status, Some(disk.path.as_path()))
-            });
-            let mut finished: Option<String> = None;
-            if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
-                let is_fork = disk.parent_session.is_some();
-                let (title, title_kind) = merged.unwrap_or_else(|| {
-                    (disk.title.clone(), disk.title_kind)
-                });
-                if s.title != title
-                    || s.title_kind != title_kind
-                    || s.is_fork != is_fork
-                    || s.agent_busy != busy
-                {
-                    changed = true;
-                }
-                if s.agent_busy && !busy {
-                    finished = Some(s.id.clone());
-                }
-                s.title = title;
-                s.title_kind = title_kind;
-                s.is_fork = is_fork;
-                s.mtime = disk.mtime;
-                s.size = disk.size;
-                s.agent_busy = busy;
-            }
-            if let Some(fid) = finished {
-                self.mark_unread_if_not_watching(&fid);
-                changed = true;
-            }
-        }
-
-        // Also detect brand-new jsonl files not yet in the list.
-        if !need_full {
-            if let Some(ws) = self.workspaces.list().get(self.selected_ws) {
-                if let Ok(disk) = self
-                    .sessions
-                    .provider()
-                    .list_sessions(Path::new(&ws.path))
-                {
-                    if disk.len()
-                        != self
-                            .session_list
-                            .iter()
-                            .filter(|s| s.path.is_some())
-                            .count()
-                    {
-                        need_full = true;
+                SessionSummaryChange::ReplaceAll {
+                    sessions,
+                    rebinds,
+                    became_idle,
+                } => {
+                    let mut select_key = self
+                        .session_list
+                        .get(self.selected_session)
+                        .map(|s| s.key.clone());
+                    self.session_list = sessions;
+                    apply_rebind_keys(&mut self.focused_session, &mut select_key, &rebinds);
+                    let keys: Vec<SessionKey> =
+                        self.session_list.iter().map(|s| s.key.clone()).collect();
+                    if let Some(i) = restore_selection(
+                        self.focus,
+                        self.focused_session.clone(),
+                        select_key,
+                        &keys,
+                    ) {
+                        self.selected_session = i;
+                    }
+                    for key in &became_idle {
+                        let watching = self.focused_session.as_ref() == Some(key);
+                        if busy_to_idle_should_mark_unread(watching) {
+                            if let Some(s) = self.session_list.iter_mut().find(|s| &s.key == key) {
+                                s.unread = true;
+                            }
+                        }
                     }
                 }
             }
-        }
-
-        if need_full {
-            self.refresh_sessions();
-        } else if changed {
-            // titles updated in place
         }
     }
 
@@ -903,13 +743,9 @@ impl App {
                 {
                     continue;
                 }
-                if let Some(translated) = translate_sgr_mouse_clipped(
-                    &seq.bytes,
-                    area.x,
-                    area.y,
-                    area.width,
-                    area.height,
-                ) {
+                if let Some(translated) =
+                    translate_sgr_mouse_clipped(&seq.bytes, area.x, area.y, area.width, area.height)
+                {
                     if let Some(wheel) = sgr_wheel_delta(&seq.bytes) {
                         let scrolled = self.scroll_agent_pane(wheel);
                         if !scrolled && child_wants_mouse {
@@ -956,10 +792,10 @@ impl App {
     }
 
     fn route_agent_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let Some(id) = self.focused_session_id.clone() else {
+        let Some(key) = self.focused_session.clone() else {
             return Ok(());
         };
-        if let Some(pty) = self.sessions.get(&id) {
+        if let Some(pty) = self.sessions.get(&key) {
             match pty.enqueue_write(bytes) {
                 Ok(()) => {}
                 Err(e) => self.status = format!("write: {e}"),
@@ -981,8 +817,8 @@ impl App {
 
     fn enter_nav(&mut self) -> Result<()> {
         if self.focus == Focus::Agent {
-            if let Some(id) = self.focused_session_id.clone() {
-                if let Some(pty) = self.sessions.get(&id) {
+            if let Some(key) = self.focused_session.clone() {
+                if let Some(pty) = self.sessions.get(&key) {
                     let modes = pty.mirrored_modes();
                     if modes.focus {
                         let _ = pty.enqueue_write_forced(b"\x1b[O");
@@ -997,8 +833,7 @@ impl App {
                         let cb = self.last_mouse_cb & 0x03;
                         let x = self.last_mouse_x.max(1);
                         let y = self.last_mouse_y.max(1);
-                        let _ = pty
-                            .enqueue_write_forced(format!("\x1b[<{cb};{x};{y}m").as_bytes());
+                        let _ = pty.enqueue_write_forced(format!("\x1b[<{cb};{x};{y}m").as_bytes());
                     }
                     self.mouse_button_down = false;
                 }
@@ -1016,24 +851,24 @@ impl App {
     }
 
     fn enter_agent(&mut self) -> Result<()> {
-        let Some(id) = self.focused_session_id.clone() else {
+        let Some(key) = self.focused_session.clone() else {
             self.status = "No session focused".into();
             return Ok(());
         };
         // Ensure size
         let area = self.pty_area;
         if area.width > 0 && area.height > 0 {
-            if let Some(pty) = self.sessions.get(&id) {
+            if let Some(pty) = self.sessions.get(&key) {
                 let _ = pty.resize(area.height, area.width);
             }
         }
         self.focus = Focus::Agent;
         // Files column hides when leaving FILE mode; pty resize is layout-driven.
         self.show_files_panel = false;
-        if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
+        if let Some(s) = self.session_list.iter_mut().find(|s| s.key == key) {
             s.unread = false;
         }
-        if let Some(pty) = self.sessions.get(&id) {
+        if let Some(pty) = self.sessions.get(&key) {
             let modes = pty.mirrored_modes();
             apply_host_modes(&mut io::stdout(), &modes)?;
             self.last_host_modes = modes;
@@ -1113,7 +948,7 @@ impl App {
             if self.escape.is_escape_seq(&seq.bytes) && self.modal.is_none() {
                 if self.focus == Focus::File {
                     self.exit_file()?;
-                } else if self.focused_session_id.is_some() {
+                } else if self.focused_session.is_some() {
                     // Toggle to agent if we have a focused session
                     self.enter_agent()?;
                 }
@@ -1136,8 +971,7 @@ impl App {
         }
 
         let side = self.sidebar_rect;
-        if self.sidebar_width == 0
-            || !point_in_rect(x, y, side.x, side.y, side.width, side.height)
+        if self.sidebar_width == 0 || !point_in_rect(x, y, side.x, side.y, side.width, side.height)
         {
             return Ok(()); // status bar / outside layout
         }
@@ -1206,10 +1040,10 @@ impl App {
             b"\r" | b"\n" => self.attach_selected()?,
             b"x" => {
                 if let Some(s) = self.session_list.get(self.selected_session) {
-                    let id = s.id.clone();
-                    self.sessions.close_session(&id);
-                    if self.focused_session_id.as_deref() == Some(&id) {
-                        self.focused_session_id = None;
+                    let key = s.key.clone();
+                    self.sessions.close_session(&key);
+                    if self.focused_session.as_ref() == Some(&key) {
+                        self.focused_session = None;
                         self.enter_nav()?;
                     }
                     self.refresh_sessions();
@@ -1223,7 +1057,6 @@ impl App {
         }
         Ok(())
     }
-
 
     /// Enter FILE mode: show the independent files column and focus it. amux
     /// owns input (like Nav). The agent column keeps rendering the PTY
@@ -1318,16 +1151,14 @@ impl App {
                     self.focus = Focus::Modal;
                 }
             }
-            Modal::ConfirmQuit { mut yes_focused } => {
-                match confirm_key(seq, &mut yes_focused) {
-                    ConfirmResult::Yes => self.should_quit = true,
-                    ConfirmResult::No => self.focus = Focus::Nav,
-                    ConfirmResult::Keep => {
-                        self.modal = Some(Modal::ConfirmQuit { yes_focused });
-                        self.focus = Focus::Modal;
-                    }
+            Modal::ConfirmQuit { mut yes_focused } => match confirm_key(seq, &mut yes_focused) {
+                ConfirmResult::Yes => self.should_quit = true,
+                ConfirmResult::No => self.focus = Focus::Nav,
+                ConfirmResult::Keep => {
+                    self.modal = Some(Modal::ConfirmQuit { yes_focused });
+                    self.focus = Focus::Modal;
                 }
-            }
+            },
             Modal::ConfirmRemoveWorkspace {
                 id,
                 name,
@@ -1347,19 +1178,17 @@ impl App {
                 }
             },
             Modal::ConfirmDeleteSession {
-                id,
+                key,
                 title,
-                path,
                 live,
                 mut yes_focused,
             } => match confirm_key(seq, &mut yes_focused) {
-                ConfirmResult::Yes => self.confirm_delete_session(&id, &title, &path)?,
+                ConfirmResult::Yes => self.confirm_delete_session(&key, &title)?,
                 ConfirmResult::No => self.focus = Focus::Nav,
                 ConfirmResult::Keep => {
                     self.modal = Some(Modal::ConfirmDeleteSession {
-                        id,
+                        key,
                         title,
-                        path,
                         live,
                         yes_focused,
                     });
@@ -1374,30 +1203,26 @@ impl App {
                     self.modal = Some(Modal::DirBrowser(b));
                     self.focus = Focus::Modal;
                 }
-                BrowserResult::Add { path, browser } => {
-                    match self.workspaces.add(&path) {
-                        Ok(ws) => {
-                            self.status = format!("Added workspace {}", ws.name);
-                            self.selected_ws = self
-                                .workspaces
-                                .list()
-                                .iter()
-                                .position(|w| w.id == ws.id)
-                                .unwrap_or(0);
-                            self.refresh_sessions();
-                            self.focus = Focus::Nav;
-                        }
-                        Err(e) => {
-                            self.modal =
-                                Some(Modal::DirBrowser(browser.with_error(e.to_string())));
-                            self.focus = Focus::Modal;
-                        }
+                BrowserResult::Add { path, browser } => match self.workspaces.add(&path) {
+                    Ok(ws) => {
+                        self.status = format!("Added workspace {}", ws.name);
+                        self.selected_ws = self
+                            .workspaces
+                            .list()
+                            .iter()
+                            .position(|w| w.id == ws.id)
+                            .unwrap_or(0);
+                        self.refresh_sessions();
+                        self.focus = Focus::Nav;
                     }
-                }
+                    Err(e) => {
+                        self.modal = Some(Modal::DirBrowser(browser.with_error(e.to_string())));
+                        self.focus = Focus::Modal;
+                    }
+                },
             },
             Modal::RenameSession {
-                id,
-                path,
+                key,
                 live,
                 mut input,
                 error: _,
@@ -1407,14 +1232,13 @@ impl App {
                 }
                 b"\r" | b"\n" => {
                     let draft = input.text.clone();
-                    match self.apply_rename_session(&id, path.as_deref(), live, &draft) {
+                    match self.apply_rename_session(&key, live, &draft) {
                         Ok(()) => {
                             self.focus = Focus::Nav;
                         }
                         Err(msg) => {
                             self.modal = Some(Modal::RenameSession {
-                                id,
-                                path,
+                                key,
                                 live,
                                 input,
                                 error: Some(msg),
@@ -1426,16 +1250,14 @@ impl App {
                 _ => {
                     if input.handle_seq(seq) {
                         self.modal = Some(Modal::RenameSession {
-                            id,
-                            path,
+                            key,
                             live,
                             input,
                             error: None,
                         });
                     } else {
                         self.modal = Some(Modal::RenameSession {
-                            id,
-                            path,
+                            key,
                             live,
                             input,
                             error: None,
@@ -1477,18 +1299,9 @@ impl App {
             self.status = "No session to delete".into();
             return Ok(());
         };
-        let Some(path) = s.path.clone() else {
-            self.status = "Session has no disk file yet (close with x, or wait for uuid)".into();
-            return Ok(());
-        };
-        if !path.exists() {
-            self.status = format!("Session file missing: {}", path.display());
-            return Ok(());
-        }
         self.modal = Some(Modal::ConfirmDeleteSession {
-            id: s.id,
+            key: s.key,
             title: s.title,
-            path,
             live: s.live,
             yes_focused: true,
         });
@@ -1502,21 +1315,11 @@ impl App {
             self.status = "No session to rename".into();
             return Ok(());
         };
-        let live_running = s.live
-            && self
-                .sessions
-                .get(&s.id)
-                .is_some_and(|p| !p.is_exited());
-        if !live_running && s.path.as_ref().is_none_or(|p| !p.exists()) {
-            self.status =
-                "Session has no disk file yet — wait for uuid, or attach first".into();
-            return Ok(());
-        }
+        let live_running = s.live && self.sessions.get(&s.key).is_some_and(|p| !p.is_exited());
         let mut input = LineInput::new();
         input.set_text(s.title.clone());
         self.modal = Some(Modal::RenameSession {
-            id: s.id,
-            path: s.path,
+            key: s.key,
             live: live_running,
             input,
             error: None,
@@ -1529,79 +1332,65 @@ impl App {
     /// Returns `Ok(())` on success, or `Err(message)` to keep the rename modal open.
     fn apply_rename_session(
         &mut self,
-        id: &str,
-        path: Option<&Path>,
+        key: &SessionKey,
         live: bool,
         draft: &str,
     ) -> std::result::Result<(), String> {
-        let title =
-            sanitize_session_title(draft).ok_or_else(|| "Title cannot be empty".to_string())?;
+        let title = self
+            .sessions
+            .normalize_title(draft)
+            .map_err(|e| format!("{e:#}"))?;
+        if title.trim().is_empty() {
+            return Err("Title cannot be empty".to_string());
+        }
 
         if live {
-            let Some(pty) = self.sessions.get(id) else {
-                // Live flag stale — fall through to disk if possible.
-                return self.rename_session_on_disk(id, path, &title);
-            };
-            if pty.is_exited() {
-                return self.rename_session_on_disk(id, path, &title);
+            let can_rename_live = self
+                .sessions
+                .get(key)
+                .map(|pty| !pty.is_exited() && pty.is_ready())
+                .unwrap_or(false);
+            if can_rename_live {
+                let action = self
+                    .sessions
+                    .rename_live(key, &title)
+                    .map_err(|e| format!("rename: {e:#}"))?;
+                if let LiveRenameAction::WritePty(bytes) = action {
+                    if let Some(pty) = self.sessions.get(key) {
+                        let _ = pty.enqueue_write(&bytes);
+                    }
+                }
+                if let Some(s) = self.session_list.iter_mut().find(|s| &s.key == key) {
+                    s.title = title.clone();
+                    s.title_source = TitleSource::Official;
+                }
+                self.status = format!("Renamed (live) {title}");
+                return Ok(());
             }
-            if !pty.is_ready() {
-                return Err("Session still starting — try again in a moment".into());
-            }
-            // Ctrl-U clears omp editor line, then slash-rename (spaces allowed).
-            let cmd = format!("\x15/rename {title}\r");
-            pty.enqueue_write(cmd.as_bytes())
-                .map_err(|e| format!("inject /rename: {e:#}"))?;
-            self.sessions.set_live_title(id, title.clone());
-            if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
-                s.title = title.clone();
-                s.title_kind = TitleKind::Official;
-            }
-            self.status = format!("Renamed (live) {title}");
-            return Ok(());
         }
 
-        self.rename_session_on_disk(id, path, &title)
-    }
-
-    fn rename_session_on_disk(
-        &mut self,
-        id: &str,
-        path: Option<&Path>,
-        title: &str,
-    ) -> std::result::Result<(), String> {
-        let path = path.ok_or_else(|| {
-            "Session has no disk file yet — wait for uuid, or attach first".to_string()
-        })?;
-        if !path.exists() {
-            return Err(format!("Session file missing: {}", path.display()));
-        }
-        write_session_title(path, title).map_err(|e| format!("write title: {e:#}"))?;
-        self.sessions.set_live_title(id, title.to_string());
+        // Stored rename (disk or exited live session)
+        self.sessions
+            .rename_stored(key, &title)
+            .map_err(|e| format!("rename: {e:#}"))?;
         self.refresh_sessions();
-        if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
-            s.title = title.to_string();
-            s.title_kind = TitleKind::Official;
+        if let Some(s) = self.session_list.iter_mut().find(|s| &s.key == key) {
+            s.title = title.clone();
+            s.title_source = TitleSource::Official;
         }
         self.status = format!("Renamed {title}");
         Ok(())
     }
 
-    fn confirm_delete_session(&mut self, id: &str, title: &str, path: &Path) -> Result<()> {
-        if self.focused_session_id.as_deref() == Some(id) && self.focus == Focus::Agent {
+    fn confirm_delete_session(&mut self, key: &SessionKey, title: &str) -> Result<()> {
+        if self.focused_session.as_ref() == Some(key) && self.focus == Focus::Agent {
             self.enter_nav()?;
         }
-        let was_live = self.sessions.is_live(id);
-        // Block until kill+flock finish so omp cannot rewrite the jsonl after
-        // unlink (fork/rebind sessions are especially prone to this race).
-        if was_live {
-            self.sessions.close_session_blocking(id);
+        let was_live = self.sessions.is_live(key);
+        if self.focused_session.as_ref() == Some(key) {
+            self.focused_session = None;
         }
-        self.sessions.join_pending_kills();
-        if self.focused_session_id.as_deref() == Some(id) {
-            self.focused_session_id = None;
-        }
-        match delete_session_with_artifacts(path) {
+        match self.sessions.delete_session(key) {
             Ok(()) => {
                 self.refresh_sessions();
                 if self.selected_session >= self.session_list.len() {
@@ -1628,11 +1417,11 @@ impl App {
         }
         let closed = self.sessions.close_workspace_sessions(id);
         if self
-            .focused_session_id
+            .focused_session
             .as_ref()
             .is_some_and(|fid| !self.sessions.is_live(fid))
         {
-            self.focused_session_id = None;
+            self.focused_session = None;
         }
         match self.workspaces.remove(id) {
             Ok(true) => {
@@ -1675,13 +1464,12 @@ impl App {
     }
 
     /// Mark unread when a turn finishes off-screen (busy → idle).
-    fn mark_unread_if_not_watching(&mut self, id: &str) {
-        let watching = self.focus == Focus::Agent
-            && self.focused_session_id.as_deref() == Some(id);
-        if watching {
+    fn mark_unread_if_not_watching(&mut self, key: &SessionKey) {
+        let watching = self.focus == Focus::Agent && self.focused_session.as_ref() == Some(key);
+        if !busy_to_idle_should_mark_unread(watching) {
             return;
         }
-        if let Some(s) = self.session_list.iter_mut().find(|s| s.id == id) {
+        if let Some(s) = self.session_list.iter_mut().find(|s| &s.key == key) {
             s.unread = true;
         }
     }
@@ -1698,46 +1486,46 @@ impl App {
     }
 
     fn refresh_sessions(&mut self) {
-        let selected_id = self
+        let selected_key = self
             .session_list
             .get(self.selected_session)
-            .map(|s| s.id.clone());
-        let prev: HashMap<String, (bool, bool)> = self
+            .map(|s| s.key.clone());
+        let prev: HashMap<SessionKey, (bool, bool)> = self
             .session_list
             .iter()
-            .map(|s| (s.id.clone(), (s.agent_busy, s.unread)))
+            .map(|s| (s.key.clone(), (s.agent_busy, s.unread)))
             .collect();
         self.session_list.clear();
+        let provider = self.sessions.default_provider_id();
         if let Some(ws) = self.workspaces.list().get(self.selected_ws) {
-            match self.sessions.list_for_workspace(&ws.id, Path::new(&ws.path)) {
+            match self.sessions.select_provider_workspace(
+                provider,
+                &ws.id,
+                Some(Path::new(&ws.path)),
+            ) {
                 Ok(list) => self.session_list = list,
                 Err(e) => self.status = format!("list sessions: {e}"),
             }
+        } else if let Err(e) = self.sessions.select_provider_workspace(provider, "", None) {
+            self.status = format!("list sessions: {e}");
         }
         // omp /fork|/branch rebinds the same PTY to a new jsonl — follow it.
-        let mut select_id = selected_id;
+        let mut select_key = selected_key;
         let rebinds = self.sessions.drain_rebinds();
-        for (old, new) in &rebinds {
-            if self.focused_session_id.as_deref() == Some(old.as_str()) {
-                self.focused_session_id = Some(new.clone());
-            }
-            if select_id.as_deref() == Some(old.as_str()) {
-                select_id = Some(new.clone());
-            }
-        }
+        apply_rebind_keys(&mut self.focused_session, &mut select_key, &rebinds);
         // Restore unread + detect busy→idle across the rescan / rebind.
         for s in &mut self.session_list {
             let key = rebinds
                 .iter()
-                .find(|(_, new)| new == &s.id)
-                .map(|(old, _)| old.as_str())
-                .unwrap_or(s.id.as_str());
+                .find(|(_, new)| new == &s.key)
+                .map(|(old, _)| old)
+                .unwrap_or(&s.key);
             if let Some((was_busy, was_unread)) = prev.get(key) {
                 s.unread = *was_unread;
                 if *was_busy && !s.agent_busy {
-                    let watching = self.focus == Focus::Agent
-                        && self.focused_session_id.as_deref() == Some(s.id.as_str());
-                    if !watching {
+                    let watching =
+                        self.focus == Focus::Agent && self.focused_session.as_ref() == Some(&s.key);
+                    if busy_to_idle_should_mark_unread(watching) {
                         s.unread = true;
                     }
                 }
@@ -1746,22 +1534,14 @@ impl App {
         // Nav/File/Modal browse must keep the user's selected row across
         // watch/poll refreshes. Agent focus keeps the attached session
         // highlighted. Fork rebind already remaps both ids above.
-        let prefer = prefer_session_selection(
-            self.focus,
-            self.focused_session_id.clone(),
-            select_id,
-        );
-        if let Some(id) = prefer {
-            if let Some(i) = self.session_list.iter().position(|s| s.id == id) {
-                self.selected_session = i;
-            } else if self.selected_session >= self.session_list.len() {
-                self.selected_session = self.session_list.len().saturating_sub(1);
-            }
+        let keys: Vec<SessionKey> = self.session_list.iter().map(|s| s.key.clone()).collect();
+        if let Some(i) =
+            restore_selection(self.focus, self.focused_session.clone(), select_key, &keys)
+        {
+            self.selected_session = i;
         } else if self.selected_session >= self.session_list.len() {
             self.selected_session = self.session_list.len().saturating_sub(1);
         }
-        self.ensure_session_watch();
-        self.last_title_poll = Instant::now();
     }
 
     fn attach_selected(&mut self) -> Result<()> {
@@ -1777,10 +1557,10 @@ impl App {
         // Live non-Exited + already focused → enter_agent only (B3).
         let already_live = summary.live
             && summary.status != SessionStatus::Exited
-            && self.focused_session_id.as_deref() == Some(summary.id.as_str())
+            && self.focused_session.as_ref() == Some(&summary.key)
             && self
                 .sessions
-                .get(&summary.id)
+                .get(&summary.key)
                 .is_some_and(|pty| !pty.is_exited());
         if already_live {
             return self.enter_agent();
@@ -1792,16 +1572,16 @@ impl App {
         if self.focus == Focus::Agent {
             self.enter_nav()?;
         }
-        let id = match self.sessions.attach_resume(
+        let key = match self.sessions.attach_resume(
             &ws.id,
             Path::new(&ws.path),
-            &summary.id,
+            &summary.key,
             &summary.title,
-            summary.title_kind,
+            summary.title_source,
             rows,
             cols,
         ) {
-            Ok(id) => id,
+            Ok(key) => key,
             Err(e) => {
                 // Recoverable (omp missing / session occupied / spawn fail):
                 // report in-app and keep the sidebar usable instead of
@@ -1811,7 +1591,7 @@ impl App {
                 return Ok(());
             }
         };
-        self.focused_session_id = Some(id);
+        self.focused_session = Some(key);
         self.refresh_sessions();
         self.enter_agent()?;
         Ok(())
@@ -1835,13 +1615,13 @@ impl App {
                 return Ok(());
             }
         };
-        self.focused_session_id = Some(id);
+        self.focused_session = Some(id);
         self.refresh_sessions();
         // Select the new one
         if let Some(pos) = self
             .session_list
             .iter()
-            .position(|s| self.focused_session_id.as_deref() == Some(&s.id))
+            .position(|s| self.focused_session.as_ref() == Some(&s.key))
         {
             self.selected_session = pos;
         }
@@ -1850,10 +1630,10 @@ impl App {
     }
 
     fn check_startup_drops(&mut self) {
-        let Some(id) = self.focused_session_id.clone() else {
+        let Some(key) = self.focused_session.clone() else {
             return;
         };
-        let Some(pty) = self.sessions.get(&id) else {
+        let Some(pty) = self.sessions.get(&key) else {
             return;
         };
         // Accumulate drops across frames; show the total once when ready.
@@ -2016,9 +1796,7 @@ impl App {
                     ICON_FOLDER
                 };
                 let icon_style = if selected {
-                    Style::default()
-                        .fg(t.selection_fg)
-                        .bg(t.selection_bg)
+                    Style::default().fg(t.selection_fg).bg(t.selection_bg)
                 } else {
                     Style::default().fg(t.project_icon)
                 };
@@ -2054,9 +1832,7 @@ impl App {
                 let selected = i == self.selected_session;
                 let (dot, dot_fg) = if s.live {
                     match s.status {
-                        SessionStatus::Running | SessionStatus::Starting => {
-                            ("●", t.session_active)
-                        }
+                        SessionStatus::Running | SessionStatus::Starting => ("●", t.session_active),
                         SessionStatus::Exited => ("○", t.session_exited),
                         _ => ("◐", t.session_detached),
                     }
@@ -2071,24 +1847,20 @@ impl App {
                         .fg(t.selection_fg)
                         .bg(t.selection_bg)
                         .add_modifier(Modifier::BOLD)
-                } else if Some(&s.id) == self.focused_session_id.as_ref() {
+                } else if self.focused_session.as_ref() == Some(&s.key) {
                     Style::default().fg(t.session_active)
-                } else if s.title_kind == TitleKind::Provisional {
+                } else if s.title_source == TitleSource::Provisional {
                     Style::default().fg(t.hint_desc_fg)
                 } else {
                     Style::default().fg(t.text_fg)
                 };
                 let meta_style = if selected {
-                    Style::default()
-                        .fg(t.selection_fg)
-                        .bg(t.selection_bg)
+                    Style::default().fg(t.selection_fg).bg(t.selection_bg)
                 } else {
                     Style::default().fg(t.hint_dim_desc_fg)
                 };
                 let fork_style = if selected {
-                    Style::default()
-                        .fg(t.selection_fg)
-                        .bg(t.selection_bg)
+                    Style::default().fg(t.selection_fg).bg(t.selection_bg)
                 } else {
                     Style::default().fg(t.session_detached)
                 };
@@ -2116,11 +1888,7 @@ impl App {
                         t.selection_fg,
                         t.selection_bg,
                         selected,
-                        if selected {
-                            t.selection_fg
-                        } else {
-                            t.text_fg
-                        },
+                        if selected { t.selection_fg } else { t.text_fg },
                     ));
                 } else {
                     spans.push(Span::styled(title, style));
@@ -2170,12 +1938,12 @@ impl App {
             .get(self.selected_session)
             .cloned()
             .or_else(|| {
-                let id = self.focused_session_id.as_ref()?;
-                self.session_list.iter().find(|s| s.id == *id).cloned()
+                let key = self.focused_session.as_ref()?;
+                self.session_list.iter().find(|s| &s.key == key).cloned()
             });
         let focused = self.focus == Focus::Agent;
         // Top chrome shows session id for triage; status bar shows the name.
-        let title = match view.as_ref().map(|s| s.id.as_str()) {
+        let title = match view.as_ref().map(|s| s.key.session_id.as_str()) {
             Some(id) => {
                 let short = if id.len() > 36 {
                     format!("{}…", &id[..35])
@@ -2226,25 +1994,19 @@ impl App {
             return;
         };
 
-        let id = summary.id.clone();
-        let running = self
-            .sessions
-            .get(&id)
-            .is_some_and(|pty| !pty.is_exited());
+        let key = summary.key.clone();
+        let running = self.sessions.get(&key).is_some_and(|pty| !pty.is_exited());
 
         // Agent column renders the full pane (the files column is a sibling).
         let content = inner;
         if running {
-            self.draw_live_pty(f, content, &id);
+            self.draw_live_pty(f, content, &key);
             self.paint_pane_sel_overlay(f);
             return;
         }
 
         // Not running: JSONL transcript preview (omp-like), optional exited banner.
-        let exited = self
-            .sessions
-            .get(&id)
-            .is_some_and(|pty| pty.is_exited());
+        let exited = self.sessions.get(&key).is_some_and(|pty| pty.is_exited());
         let mut body = content;
         if exited {
             let banner_area = Rect {
@@ -2277,7 +2039,7 @@ impl App {
             }
         }
 
-        let Some(path) = summary.path.clone() else {
+        if summary.path.is_none() {
             f.render_widget(
                 Paragraph::new(Span::styled(
                     "No session file yet.",
@@ -2286,8 +2048,8 @@ impl App {
                 body,
             );
             return;
-        };
-        self.ensure_transcript_cache(&path, summary.mtime, summary.size, summary.provider);
+        }
+        self.ensure_transcript_cache(&summary.key, summary.mtime, summary.size);
         self.draw_transcript_preview(f, body);
         self.paint_pane_sel_overlay(f);
     }
@@ -2305,7 +2067,7 @@ impl App {
         let title = match self
             .session_list
             .get(self.selected_session)
-            .map(|s| s.id.as_str())
+            .map(|s| s.key.session_id.as_str())
         {
             Some(id) => {
                 let short = if id.len() > 30 {
@@ -2351,30 +2113,34 @@ impl App {
             .get(self.selected_session)
             .cloned()
             .or_else(|| {
-                let id = self.focused_session_id.as_ref()?;
-                self.session_list.iter().find(|s| s.id == *id).cloned()
+                let key = self.focused_session.as_ref()?;
+                self.session_list.iter().find(|s| &s.key == key).cloned()
             })
         else {
             f.render_widget(
                 Paragraph::new(Span::styled(
                     "Select a session to see its file changes.",
-                    Style::default().fg(self.theme.hint_desc_fg).bg(self.theme.app_bg),
+                    Style::default()
+                        .fg(self.theme.hint_desc_fg)
+                        .bg(self.theme.app_bg),
                 )),
                 inner,
             );
             return;
         };
-        let Some(path) = summary.path.clone() else {
+        if summary.path.is_none() {
             f.render_widget(
                 Paragraph::new(Span::styled(
                     "No session file yet — attach first to populate diffs.",
-                    Style::default().fg(self.theme.hint_desc_fg).bg(self.theme.app_bg),
+                    Style::default()
+                        .fg(self.theme.hint_desc_fg)
+                        .bg(self.theme.app_bg),
                 )),
                 inner,
             );
             return;
-        };
-        self.ensure_modified_files_cache(&path, summary.size, summary.provider, &summary.cwd);
+        }
+        self.ensure_modified_files_cache(&summary.key, summary.size);
         let file_index = self.clamp_file_selected();
         self.ensure_diff_cache(file_index);
 
@@ -2411,10 +2177,16 @@ impl App {
             )];
             spans.push(Span::styled(
                 op_ch.to_string(),
-                Style::default().fg(op_fg).bg(t.app_bg).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(op_fg)
+                    .bg(t.app_bg)
+                    .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(" ", Style::default().bg(t.app_bg)));
-            spans.push(Span::styled(path_disp, Style::default().fg(t.text_fg).bg(t.app_bg)));
+            spans.push(Span::styled(
+                path_disp,
+                Style::default().fg(t.text_fg).bg(t.app_bg),
+            ));
             spans.push(Span::styled(
                 format!(" ×{} {}", f.count, time),
                 Style::default().fg(t.hint_dim_desc_fg).bg(t.app_bg),
@@ -2458,7 +2230,10 @@ impl App {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{ch} "),
-                    Style::default().fg(col).bg(t.app_bg).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(col)
+                        .bg(t.app_bg)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(text, Style::default().fg(col).bg(t.app_bg)),
             ]));
@@ -2469,12 +2244,10 @@ impl App {
         }
 
         // Footer hint.
-        lines.push(Line::from(vec![
-            Span::styled(
-                " j/k file · ↑↓ scroll · Ctrl-N/Esc exit",
-                Style::default().fg(t.hint_dim_desc_fg).bg(t.app_bg),
-            ),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            " j/k file · ↑↓ scroll · Ctrl-N/Esc exit",
+            Style::default().fg(t.hint_dim_desc_fg).bg(t.app_bg),
+        )]));
 
         f.render_widget(
             Paragraph::new(lines).style(Style::default().bg(t.app_bg)),
@@ -2497,14 +2270,14 @@ impl App {
         paint_selection_overlay(f.buffer_mut(), sel, style);
     }
 
-    fn draw_live_pty(&mut self, f: &mut Frame, inner: Rect, id: &str) {
-        if let Some(pty) = self.sessions.get(id) {
+    fn draw_live_pty(&mut self, f: &mut Frame, inner: Rect, key: &SessionKey) {
+        if let Some(pty) = self.sessions.get(key) {
             let (lr, lc) = pty.last_size();
             if lr != inner.height || lc != inner.width {
                 let _ = pty.resize(inner.height, inner.width);
             }
         }
-        let Some(pty) = self.sessions.get(id) else {
+        let Some(pty) = self.sessions.get(key) else {
             return;
         };
         let snap = pty.snapshot();
@@ -2552,23 +2325,17 @@ impl App {
         }
     }
 
-    fn ensure_transcript_cache(
-        &mut self,
-        path: &Path,
-        mtime: DateTime<Utc>,
-        size: u64,
-        provider: &str,
-    ) {
+    fn ensure_transcript_cache(&mut self, key: &SessionKey, mtime: DateTime<Utc>, size: u64) {
         let fresh = self
             .transcript_cache
             .as_ref()
-            .is_some_and(|c| c.path == path && c.mtime == mtime && c.size == size);
+            .is_some_and(|c| transcript_cache_fresh(&c.key, c.mtime, c.size, key, mtime, size));
         if fresh {
             return;
         }
-        let blocks = load(provider, path);
+        let blocks = self.sessions.load_transcript(key).unwrap_or_default();
         self.transcript_cache = Some(TranscriptCache {
-            path: path.to_path_buf(),
+            key: key.clone(),
             mtime,
             size,
             blocks,
@@ -2576,22 +2343,24 @@ impl App {
         });
     }
 
-
-    /// Refresh the modified-files aggregation for `path`. A different session
+    /// Refresh the modified-files aggregation for a session. A different session
     /// starts a fresh scan; otherwise only the bytes appended since the last
     /// poll are parsed, and an unchanged size costs nothing.
-    fn ensure_modified_files_cache(&mut self, path: &Path, size: u64, provider: &str, cwd: &Path) {
+    fn ensure_modified_files_cache(&mut self, key: &SessionKey, size: u64) {
         if self
             .modified_files_cache
             .as_ref()
-            .is_none_or(|c| c.path != path)
+            .is_none_or(|c| !modified_files_cache_matches(&c.key, key))
         {
-            let Some(scan) = modified_files_scan(provider, cwd) else {
-                self.modified_files_cache = None;
-                return;
+            let scan = match self.sessions.modified_files_scanner(key) {
+                Ok(Some(scan)) => scan,
+                _ => {
+                    self.modified_files_cache = None;
+                    return;
+                }
             };
             self.modified_files_cache = Some(ModifiedFilesCache {
-                path: path.to_path_buf(),
+                key: key.clone(),
                 size: u64::MAX,
                 scan,
                 diff: None,
@@ -2599,14 +2368,24 @@ impl App {
             self.file_selected = 0;
             self.diff_scroll = 0;
         }
-        let Some(cache) = self.modified_files_cache.as_mut() else {
-            return;
-        };
-        if cache.size == size {
-            return;
+        {
+            let Some(cache) = self.modified_files_cache.as_mut() else {
+                return;
+            };
+            if cache.size == size {
+                return;
+            }
+            cache.size = size;
         }
-        cache.size = size;
-        cache.scan.poll(path);
+        let changed = {
+            let cache = self
+                .modified_files_cache
+                .as_mut()
+                .expect("modified-files cache exists after ensure");
+            self.sessions
+                .advance_modified_files(cache.scan.as_mut(), key)
+        };
+        let _ = changed;
     }
 
     /// Keep the row cursor inside the current aggregate; returns its index.
@@ -2637,7 +2416,7 @@ impl App {
         {
             return;
         }
-        let lines = cache.scan.file_diff(file_index);
+        let lines = cache.scan.render_diff(file_index);
         cache.diff = Some(DiffCache {
             version,
             file_index,
@@ -2646,9 +2425,9 @@ impl App {
     }
 
     fn focused_child_wants_mouse(&self) -> bool {
-        self.focused_session_id
+        self.focused_session
             .as_ref()
-            .and_then(|id| self.sessions.get(id))
+            .and_then(|key| self.sessions.get(key))
             .map(|pty| {
                 let m = pty.mirrored_modes();
                 m.mouse_1000 || m.mouse_1002 || m.mouse_1003
@@ -2679,11 +2458,11 @@ impl App {
         };
         let exited = self
             .sessions
-            .get(&summary.id)
+            .get(&summary.key)
             .is_some_and(|p| p.is_exited());
         let live = self
             .sessions
-            .get(&summary.id)
+            .get(&summary.key)
             .is_some_and(|p| !p.is_exited());
         if live || !exited || inner.height <= 1 {
             return inner;
@@ -2722,8 +2501,14 @@ impl App {
             // Keep using the area captured at press (layout rarely changes mid-drag).
             if sgr_is_motion(seq) || (!sgr_is_release(seq) && sel.dragged) {
                 // Clamp pointer into content even if it drifts over the sidebar.
-                let cx = x.clamp(sel.area.x, sel.area.x.saturating_add(sel.area.width.saturating_sub(1)));
-                let cy = y.clamp(sel.area.y, sel.area.y.saturating_add(sel.area.height.saturating_sub(1)));
+                let cx = x.clamp(
+                    sel.area.x,
+                    sel.area.x.saturating_add(sel.area.width.saturating_sub(1)),
+                );
+                let cy = y.clamp(
+                    sel.area.y,
+                    sel.area.y.saturating_add(sel.area.height.saturating_sub(1)),
+                );
                 sel.update_end(cx, cy);
                 return Ok(true);
             }
@@ -2773,7 +2558,11 @@ impl App {
         }
         let n = text.chars().count();
         let raw = osc52_clipboard_set(&text);
-        let seq = if is_inside_tmux() { wrap_tmux_passthrough(&raw) } else { raw };
+        let seq = if is_inside_tmux() {
+            wrap_tmux_passthrough(&raw)
+        } else {
+            raw
+        };
         io::stdout().write_all(&seq)?;
         io::stdout().flush()?;
         self.status = format!("copied {n} chars");
@@ -2791,10 +2580,10 @@ impl App {
         };
         let live = self
             .sessions
-            .get(&summary.id)
+            .get(&summary.key)
             .is_some_and(|p| !p.is_exited());
         if live {
-            if let Some(pty) = self.sessions.get(&summary.id) {
+            if let Some(pty) = self.sessions.get(&summary.key) {
                 return text_from_snapshot(&pty.snapshot(), a, b);
             }
             return String::new();
@@ -2842,12 +2631,12 @@ impl App {
         };
         let live = self
             .sessions
-            .get(&summary.id)
+            .get(&summary.key)
             .is_some_and(|pty| !pty.is_exited());
         if live {
             return self
                 .sessions
-                .get(&summary.id)
+                .get(&summary.key)
                 .map(|pty| pty.scroll_display_lines(lines))
                 .unwrap_or(false);
         }
@@ -2855,15 +2644,12 @@ impl App {
     }
 
     fn scroll_transcript_preview(&mut self, lines: i32, summary: &SessionSummary) -> bool {
-        let Some(path) = summary.path.clone() else {
-            return false;
-        };
-        self.ensure_transcript_cache(&path, summary.mtime, summary.size, &summary.provider);
+        self.ensure_transcript_cache(&summary.key, summary.mtime, summary.size);
         let h = {
             let base = self.pty_area.height as usize;
             let exited = self
                 .sessions
-                .get(&summary.id)
+                .get(&summary.key)
                 .is_some_and(|p| p.is_exited());
             if exited && base > 1 {
                 base - 1
@@ -2916,7 +2702,10 @@ impl App {
         while lines.len() < h {
             lines.insert(0, Line::from(""));
         }
-        f.render_widget(Paragraph::new(lines).style(Style::default().bg(t.app_bg)), area);
+        f.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(t.app_bg)),
+            area,
+        );
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
@@ -2992,13 +2781,13 @@ impl App {
         let mut left: Vec<(String, Color, Color)> = Vec::new();
         left.push((mode_label.into(), t.status_mode_fg, mode_bg));
 
-        if let Some(id) = &self.focused_session_id {
+        if let Some(key) = &self.focused_session {
             let name = self
                 .session_list
                 .iter()
-                .find(|s| s.id == *id)
+                .find(|s| &s.key == key)
                 .map(|s| s.title.as_str())
-                .unwrap_or(id.as_str());
+                .unwrap_or(key.session_id.as_str());
             let short = if name.chars().count() > 24 {
                 format!("{}…", name.chars().take(23).collect::<String>())
             } else {
@@ -3193,10 +2982,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
             ">",
             Style::default().fg(theme.hint_bracket_fg).bg(panel_bg),
         ));
-        spans.push(Span::styled(
-            " ".repeat(pad),
-            Style::default().bg(panel_bg),
-        ));
+        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(panel_bg)));
         spans.push(Span::styled(desc.to_string(), desc_style));
         Line::from(spans)
     };
@@ -3219,14 +3005,20 @@ fn draw_help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
         ("Enter", "attach / resume selected session"),
         ("click", "select workspace/session · Agent pane attaches"),
         ("dbl-click", "session row → attach / resume (same as Enter)"),
-        ("drag", "select text in Agent pane (clipped; Alt/Shift if omp owns mouse)"),
+        (
+            "drag",
+            "select text in Agent pane (clipped; Alt/Shift if omp owns mouse)",
+        ),
         ("Ctrl-N", "Agent → modified-files panel · Nav m toggles it"),
         ("Esc", "close this help"),
     ] {
         lines.push(help_key_row(k, d));
     }
     lines.push(Line::from(Span::styled("", body_style)));
-    lines.push(Line::from(Span::styled("Workspace & session", section_style)));
+    lines.push(Line::from(Span::styled(
+        "Workspace & session",
+        section_style,
+    )));
     for (k, d) in [
         ("a", "add workspace (browser: o add · / search · g path)"),
         ("D", "remove workspace (confirm; keeps omp files on disk)"),
@@ -3297,7 +3089,10 @@ fn seg_width(segs: &[(String, Color, Color)]) -> usize {
     if segs.is_empty() {
         return 0;
     }
-    segs.iter().map(|(t, _, _)| t.chars().count()).sum::<usize>() + segs.len().saturating_sub(1)
+    segs.iter()
+        .map(|(t, _, _)| t.chars().count())
+        .sum::<usize>()
+        + segs.len().saturating_sub(1)
 }
 
 /// Left powerline chain + filler + right-aligned chain (workspace).
@@ -3340,10 +3135,7 @@ fn render_powerline(
             left_complete = false;
             break;
         }
-        spans.push(Span::styled(
-            text.clone(),
-            Style::default().fg(*fg).bg(*bg),
-        ));
+        spans.push(Span::styled(text.clone(), Style::default().fg(*fg).bg(*bg)));
         used += body_w;
         last_bg = *bg;
         if need_arrow {
@@ -3366,10 +3158,7 @@ fn render_powerline(
     }
     let pad = max_w.saturating_sub(used + right_w);
     if pad > 0 {
-        spans.push(Span::styled(
-            " ".repeat(pad),
-            Style::default().bg(fill_bg),
-        ));
+        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(fill_bg)));
         used += pad;
     }
 
@@ -3381,10 +3170,7 @@ fn render_powerline(
         ));
         used += 1;
         for (i, (text, fg, bg)) in right.iter().enumerate() {
-            spans.push(Span::styled(
-                text.clone(),
-                Style::default().fg(*fg).bg(*bg),
-            ));
+            spans.push(Span::styled(text.clone(), Style::default().fg(*fg).bg(*bg)));
             used += text.chars().count();
             if i + 1 < right.len() {
                 let next_bg = right[i + 1].2;
@@ -3407,7 +3193,11 @@ fn render_powerline(
 }
 
 /// Pack hint badges left-to-right; if the next pair won't fit, append `…` (dux).
-fn fit_hint_spans<'a>(theme: &'a Theme, hints: &[(&'a str, &'a str)], max_w: usize) -> Vec<Span<'a>> {
+fn fit_hint_spans<'a>(
+    theme: &'a Theme,
+    hints: &[(&'a str, &'a str)],
+    max_w: usize,
+) -> Vec<Span<'a>> {
     let mut spans = Vec::new();
     let mut used = 0usize;
     for (key, desc) in hints {
@@ -3535,10 +3325,7 @@ fn draw_confirm_button(f: &mut Frame, area: Rect, theme: &Theme, label: &str, fo
     let label_w = unicode_width::UnicodeWidthStr::width(label) as u16;
     let pad = inner.width.saturating_sub(label_w) / 2;
     let line = Line::from(vec![
-        Span::styled(
-            " ".repeat(pad as usize),
-            Style::default().bg(fill_bg),
-        ),
+        Span::styled(" ".repeat(pad as usize), Style::default().bg(fill_bg)),
         Span::styled(
             label.to_string(),
             Style::default()
@@ -3567,9 +3354,7 @@ fn draw_rename_dialog(
     let title = " Rename session ";
     let prompt = "New name:";
     // Fixed dialog width — does not grow with input length.
-    let w = 48u16
-        .min(area.width.saturating_sub(4).max(36))
-        .max(36);
+    let w = 48u16.min(area.width.saturating_sub(4).max(36)).max(36);
     let h = if error.is_some() { 9 } else { 8 }.min(area.height.saturating_sub(2).max(8));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
@@ -3611,9 +3396,7 @@ fn draw_rename_dialog(
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             prompt.to_string(),
-            Style::default()
-                .fg(theme.hint_desc_fg)
-                .bg(theme.overlay_bg),
+            Style::default().fg(theme.hint_desc_fg).bg(theme.overlay_bg),
         )))
         .style(Style::default().bg(theme.overlay_bg)),
         chunks[0],
@@ -3663,9 +3446,7 @@ fn draw_rename_dialog(
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 shown,
-                Style::default()
-                    .fg(theme.error)
-                    .bg(theme.overlay_bg),
+                Style::default().fg(theme.error).bg(theme.overlay_bg),
             )))
             .style(Style::default().bg(theme.overlay_bg)),
             chunks[2],
@@ -3732,7 +3513,9 @@ fn draw_confirm_dialog(
         inner,
     );
 
-    let body_h = (body.len() as u16).saturating_add(1).min(inner.height.saturating_sub(5));
+    let body_h = (body.len() as u16)
+        .saturating_add(1)
+        .min(inner.height.saturating_sub(5));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3748,9 +3531,7 @@ fn draw_confirm_dialog(
         .map(|s| {
             Line::from(Span::styled(
                 (*s).to_string(),
-                Style::default()
-                    .fg(theme.text_fg)
-                    .bg(theme.overlay_bg),
+                Style::default().fg(theme.text_fg).bg(theme.overlay_bg),
             ))
         })
         .collect();
@@ -3825,7 +3606,6 @@ fn compute_pty_area(size: ratatui::layout::Rect) -> ratatui::layout::Rect {
         }
     }
 }
-
 
 /// Parse (cb, col, row) from an SGR mouse sequence — all 1-based.
 fn parse_sgr_cxy(seq: &[u8]) -> Option<(u8, u16, u16)> {
@@ -3906,7 +3686,9 @@ fn rendered_line_to_ratatui(t: &Theme, rl: &RenderedLine, width: u16) -> Line<'s
         if pad > 0 {
             spans.push(Span::styled(
                 " ".repeat(pad),
-                Style::default().fg(t.transcript_user_fg).bg(t.transcript_user_bg),
+                Style::default()
+                    .fg(t.transcript_user_fg)
+                    .bg(t.transcript_user_bg),
             ));
         }
     }
@@ -4036,24 +3818,70 @@ fn poll_fd(fd: i32, timeout: Duration) -> Result<bool> {
     }
 }
 
-
 /// Sidebar selection after a session-list refresh.
 /// Nav/File/Modal keep the browsed row; Agent keeps the attached session.
 fn prefer_session_selection(
     focus: Focus,
-    focused_session_id: Option<String>,
-    select_id: Option<String>,
-) -> Option<String> {
+    focused_session: Option<SessionKey>,
+    select_key: Option<SessionKey>,
+) -> Option<SessionKey> {
     if focus == Focus::Agent {
-        focused_session_id.or(select_id)
+        focused_session.or(select_key)
     } else {
-        select_id.or(focused_session_id)
+        select_key.or(focused_session)
     }
+}
+
+/// Pick the preferred key, then its index in the refreshed session list.
+fn restore_selection(
+    focus: Focus,
+    focused: Option<SessionKey>,
+    selected: Option<SessionKey>,
+    list: &[SessionKey],
+) -> Option<usize> {
+    let prefer = prefer_session_selection(focus, focused, selected)?;
+    list.iter().position(|k| k == &prefer)
+}
+
+fn apply_rebind_keys(
+    focused: &mut Option<SessionKey>,
+    selected: &mut Option<SessionKey>,
+    rebinds: &[(SessionKey, SessionKey)],
+) {
+    for (old, new) in rebinds {
+        if focused.as_ref() == Some(old) {
+            *focused = Some(new.clone());
+        }
+        if selected.as_ref() == Some(old) {
+            *selected = Some(new.clone());
+        }
+    }
+}
+
+fn transcript_cache_fresh(
+    cache_key: &SessionKey,
+    cache_mtime: DateTime<Utc>,
+    cache_size: u64,
+    key: &SessionKey,
+    mtime: DateTime<Utc>,
+    size: u64,
+) -> bool {
+    cache_key == key && cache_mtime == mtime && cache_size == size
+}
+
+fn modified_files_cache_matches(cache_key: &SessionKey, key: &SessionKey) -> bool {
+    cache_key == key
+}
+
+fn busy_to_idle_should_mark_unread(watching_same_key: bool) -> bool {
+    !watching_same_key
 }
 
 #[cfg(test)]
 mod escape_key_tests {
-    use super::{confirm_key, is_escape_key, prefer_session_selection, ConfirmResult, Focus};
+    use super::{
+        confirm_key, is_escape_key, prefer_session_selection, ConfirmResult, Focus, SessionKey,
+    };
 
     #[test]
     fn escape_key_bare_and_kitty() {
@@ -4079,24 +3907,133 @@ mod escape_key_tests {
     fn nav_refresh_keeps_browsed_selection() {
         let prefer = prefer_session_selection(
             Focus::Nav,
-            Some("new-1".into()),
-            Some("old-session".into()),
+            Some(SessionKey::omp("new-1")),
+            Some(SessionKey::omp("old-session")),
         );
-        assert_eq!(prefer.as_deref(), Some("old-session"));
+        assert_eq!(
+            prefer.as_ref().map(|k| k.session_id.as_str()),
+            Some("old-session")
+        );
     }
 
     #[test]
     fn agent_refresh_keeps_focused_selection() {
         let prefer = prefer_session_selection(
             Focus::Agent,
-            Some("new-1".into()),
-            Some("old-session".into()),
+            Some(SessionKey::omp("new-1")),
+            Some(SessionKey::omp("old-session")),
         );
-        assert_eq!(prefer.as_deref(), Some("new-1"));
+        assert_eq!(
+            prefer.as_ref().map(|k| k.session_id.as_str()),
+            Some("new-1")
+        );
     }
 }
 
+#[cfg(test)]
+mod selection_cache_tests {
+    use super::{
+        apply_rebind_keys, busy_to_idle_should_mark_unread, modified_files_cache_matches,
+        restore_selection, transcript_cache_fresh, Focus, SessionKey,
+    };
+    use crate::provider::api::ProviderId;
+    use chrono::{TimeZone, Utc};
 
+    #[test]
+    fn restore_selection_uses_full_session_key() {
+        let omp_x = SessionKey::omp("x");
+        let fake_x = SessionKey::new(ProviderId::new("fake"), "x");
+        let omp_y = SessionKey::omp("y");
+        let list = [omp_x.clone(), fake_x.clone(), omp_y.clone()];
+
+        // Agent keeps the focused key (fake/x), not the browsed omp/x.
+        assert_eq!(
+            restore_selection(
+                Focus::Agent,
+                Some(fake_x.clone()),
+                Some(omp_x.clone()),
+                &list,
+            ),
+            Some(1)
+        );
+        // Nav keeps the selected key (omp/x).
+        assert_eq!(
+            restore_selection(Focus::Nav, Some(fake_x.clone()), Some(omp_x.clone()), &list,),
+            Some(0)
+        );
+        // Same bare id, different provider must not steal selection.
+        let omp_only = [omp_x.clone(), omp_y.clone()];
+        assert_eq!(
+            restore_selection(
+                Focus::Nav,
+                Some(fake_x.clone()),
+                Some(fake_x.clone()),
+                &omp_only,
+            ),
+            None
+        );
+        assert_eq!(
+            restore_selection(
+                Focus::Agent,
+                Some(fake_x.clone()),
+                Some(omp_x.clone()),
+                &omp_only,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_rebind_updates_focused_and_selected_keys() {
+        let old = SessionKey::omp("old");
+        let new = SessionKey::omp("new");
+        let other = SessionKey::omp("other");
+        let rebinds = [(old.clone(), new.clone())];
+
+        let mut focused = Some(old.clone());
+        let mut selected = Some(old.clone());
+        apply_rebind_keys(&mut focused, &mut selected, &rebinds);
+        assert_eq!(focused, Some(new.clone()));
+        assert_eq!(selected, Some(new.clone()));
+
+        let mut focused = Some(other.clone());
+        let mut selected = Some(other.clone());
+        apply_rebind_keys(&mut focused, &mut selected, &rebinds);
+        assert_eq!(focused, Some(other.clone()));
+        assert_eq!(selected, Some(other));
+    }
+
+    #[test]
+    fn transcript_cache_invalidates_on_key_or_revision_change() {
+        let key = SessionKey::omp("a");
+        let other = SessionKey::omp("b");
+        let t1 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let t2 = Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+
+        assert!(transcript_cache_fresh(&key, t1, 10, &key, t1, 10));
+        assert!(!transcript_cache_fresh(&key, t1, 10, &other, t1, 10));
+        assert!(!transcript_cache_fresh(&key, t1, 10, &key, t2, 10));
+        assert!(!transcript_cache_fresh(&key, t1, 10, &key, t1, 11));
+    }
+
+    #[test]
+    fn modified_files_cache_invalidates_on_session_key_change() {
+        let omp_a = SessionKey::omp("a");
+        let omp_b = SessionKey::omp("b");
+        let omp_x = SessionKey::omp("x");
+        let fake_x = SessionKey::new(ProviderId::new("fake"), "x");
+
+        assert!(modified_files_cache_matches(&omp_a, &omp_a));
+        assert!(!modified_files_cache_matches(&omp_a, &omp_b));
+        assert!(!modified_files_cache_matches(&omp_x, &fake_x));
+    }
+
+    #[test]
+    fn busy_to_idle_marks_unread_only_when_not_watching_same_key() {
+        assert!(!busy_to_idle_should_mark_unread(true));
+        assert!(busy_to_idle_should_mark_unread(false));
+    }
+}
 
 /// Extract HH:MM:SS from an ISO 8601 timestamp like
 /// "2026-08-01T13:56:54.689Z" → "13:56:54". Falls back to the raw tail.

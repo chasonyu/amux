@@ -1,10 +1,11 @@
 //! OmpProvider: list disk sessions + build spawn/resume argv.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -13,6 +14,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config::AmuxConfig;
+use crate::provider::api::{
+    AgentProvider, LiveRenameAction, ModifiedFilesScanner, ProviderCapabilities, ProviderChange,
+    ProviderId, ProviderSession, SessionKey, SpawnSpec, TitleSource,
+};
+use crate::provider::transcript::{DiffLine, ModifiedFile, ModifiedFilesScan, TranscriptBlock};
+use crate::provider::turn_status::SessionActivityTracker;
+use crate::provider::watch::{SessionDirEvent, SessionDirWatcher};
 
 /// omp JSONL first-line title slot (including trailing newline).
 pub const TITLE_SLOT_BYTES: usize = 256;
@@ -73,7 +81,26 @@ pub struct OmpProvider {
     pub omp_bin: String,
     pub session_dir_override: Option<PathBuf>,
     pub profile: Option<String>,
+    /// PI_* env pins resolved from config (for SpawnSpec).
+    pi_pins: Vec<(String, String)>,
+    /// Moved from SessionSupervisor (§1.6).
+    activity: SessionActivityTracker,
+    /// Moved from Shell (§1.5).
+    watcher: SessionDirWatcher,
+    dirty_paths: HashSet<PathBuf>,
+    debounce_until: Option<Instant>,
+    need_rescan: bool,
+    last_poll: Instant,
+    /// Current watched workspace cwd (for fallback poll).
+    watched_cwd: Option<PathBuf>,
+    /// Last known session fingerprints for fallback poll.
+    known_sessions: HashMap<PathBuf, (DateTime<Utc>, u64)>,
 }
+
+/// Title refresh debounce (§1.5: ~80ms).
+const TITLE_WATCH_DEBOUNCE: Duration = Duration::from_millis(80);
+/// Title fallback poll interval (§1.5: 3s).
+const TITLE_FALLBACK_POLL: Duration = Duration::from_secs(3);
 
 impl OmpProvider {
     pub fn from_config(cfg: &AmuxConfig) -> Self {
@@ -81,6 +108,15 @@ impl OmpProvider {
             omp_bin: cfg.omp_command(),
             session_dir_override: cfg.session_dir.as_ref().map(PathBuf::from),
             profile: cfg.profile.clone(),
+            pi_pins: cfg.effective_pi_pins(),
+            activity: SessionActivityTracker::default(),
+            watcher: SessionDirWatcher::spawn(),
+            dirty_paths: HashSet::new(),
+            debounce_until: None,
+            need_rescan: false,
+            last_poll: Instant::now(),
+            watched_cwd: None,
+            known_sessions: HashMap::new(),
         }
     }
 
@@ -143,6 +179,340 @@ impl OmpProvider {
     }
 }
 
+/// Best-effort parse of `pgrep -af omp` output for an external resume of `session_id`.
+fn parse_external_omp_resume(process_list: &str, session_id: &str) -> Option<String> {
+    let prefix = if session_id.len() > 8 {
+        &session_id[..8]
+    } else {
+        session_id
+    };
+    for line in process_list.lines() {
+        let lower = line.to_ascii_lowercase();
+        let resume_hit =
+            lower.contains("--resume") || lower.contains(" -r ") || lower.contains(" -r=");
+        if resume_hit && line.contains(prefix) {
+            if lower.contains("amux") {
+                continue;
+            }
+            return Some(line.trim().to_string());
+        }
+    }
+    None
+}
+
+// --- SPI helpers ---
+
+fn title_kind_to_source(kind: TitleKind) -> TitleSource {
+    match kind {
+        TitleKind::Official => TitleSource::Official,
+        TitleKind::Provisional => TitleSource::Provisional,
+        TitleKind::Fallback => TitleSource::Fallback,
+    }
+}
+
+/// Adapter wrapping [`ModifiedFilesScan`] as [`ModifiedFilesScanner`].
+struct OmpModifiedFilesScanner {
+    scan: ModifiedFilesScan,
+}
+
+impl ModifiedFilesScanner for OmpModifiedFilesScanner {
+    fn advance(&mut self, session: &ProviderSession) -> Result<bool> {
+        let path = session
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("omp session has no path for modified-files scan"))?;
+        Ok(self.scan.poll(path))
+    }
+    fn version(&self) -> u64 {
+        self.scan.version()
+    }
+    fn files(&self) -> &[ModifiedFile] {
+        self.scan.files()
+    }
+    fn render_diff(&self, file_index: usize) -> Vec<DiffLine> {
+        self.scan.file_diff(file_index)
+    }
+}
+
+impl AgentProvider for OmpProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::OMP
+    }
+
+    fn display_name(&self) -> &'static str {
+        "omp"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::OMP
+    }
+
+    fn available(&self) -> Result<()> {
+        if self.omp_available() {
+            Ok(())
+        } else {
+            bail!(
+                "omp not found at '{}'. Install omp and ensure it is on PATH.",
+                self.omp_bin
+            )
+        }
+    }
+
+    fn list_sessions(&mut self, cwd: &Path) -> Result<Vec<ProviderSession>> {
+        let disk = list_omp_sessions(&self.sessions_root(), cwd)?;
+        // Update known fingerprints for fallback poll.
+        self.known_sessions.clear();
+        for d in &disk {
+            self.known_sessions
+                .insert(d.path.clone(), (d.mtime, d.size));
+        }
+        Ok(disk
+            .into_iter()
+            .map(|d| ProviderSession {
+                key: SessionKey::omp(&d.id),
+                title: d.title,
+                title_source: title_kind_to_source(d.title_kind),
+                parent_ref: d.parent_session,
+                path: Some(d.path),
+                cwd: cwd.to_path_buf(),
+                modified_at: d.mtime,
+                size: d.size,
+            })
+            .collect())
+    }
+
+    fn spawn_new(&self, cwd: &Path) -> Result<SpawnSpec> {
+        Ok(SpawnSpec {
+            program: self.omp_bin.clone(),
+            args: self.spawn_new_args(cwd),
+            env: self.pi_pins.clone(),
+            cwd: cwd.to_path_buf(),
+        })
+    }
+
+    fn spawn_resume(&self, cwd: &Path, session_id: &str) -> Result<SpawnSpec> {
+        Ok(SpawnSpec {
+            program: self.omp_bin.clone(),
+            args: self.spawn_resume_args(cwd, session_id),
+            env: self.pi_pins.clone(),
+            cwd: cwd.to_path_buf(),
+        })
+    }
+
+    fn check_external_occupant(&self, session_id: &str) -> Result<()> {
+        let process_list = match Command::new("pgrep").args(["-af", "omp"]).output() {
+            Ok(output) if output.status.success() || !output.stdout.is_empty() => {
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            }
+            _ => return Ok(()),
+        };
+        if let Some(line) = parse_external_omp_resume(&process_list, session_id) {
+            bail!(
+                "session appears occupied by external omp:\n  {line}\n\
+                 Attach refused (no force-hijack)."
+            );
+        }
+        Ok(())
+    }
+
+    fn parent_refers_to(&self, parent_ref: &str, session_id: &str) -> bool {
+        parent_refers_to(parent_ref, session_id)
+    }
+
+    fn session_busy(&mut self, session: &ProviderSession, live: bool, pty_active: bool) -> bool {
+        self.activity.busy(
+            &session.key.session_id,
+            live,
+            pty_active,
+            session.path.as_deref(),
+        )
+    }
+
+    fn forget_session(&mut self, key: &SessionKey) {
+        self.activity.forget(&key.session_id);
+    }
+
+    fn normalize_title(&self, draft: &str) -> Result<String> {
+        sanitize_session_title(draft).ok_or_else(|| anyhow::anyhow!("Title cannot be empty"))
+    }
+
+    fn rename_live(&mut self, _session: &ProviderSession, title: &str) -> Result<LiveRenameAction> {
+        // Ctrl-U clears the omp editor line, then /rename + title + CR.
+        let bytes = format!("\x15/rename {title}\r").into_bytes();
+        Ok(LiveRenameAction::WritePty(bytes))
+    }
+
+    fn rename_stored(&mut self, session: &ProviderSession, title: &str) -> Result<()> {
+        let path = session
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("omp session has no path for stored rename"))?;
+        write_session_title(path, title)
+    }
+
+    fn delete_stored(&mut self, session: &ProviderSession) -> Result<()> {
+        let path = session
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("omp session has no path for delete"))?;
+        delete_session_with_artifacts(path)
+    }
+
+    fn select_workspace(&mut self, cwd: Option<&Path>) -> Result<()> {
+        // Stop old watcher, discard old workspace queue.
+        self.dirty_paths.clear();
+        self.debounce_until = None;
+        self.need_rescan = false;
+        self.last_poll = Instant::now();
+        self.known_sessions.clear();
+
+        match cwd {
+            Some(cwd) => {
+                let dir = self.session_dir_for_cwd(cwd);
+                self.watcher.set_dir(Some(dir));
+                self.watched_cwd = Some(cwd.to_path_buf());
+            }
+            None => {
+                self.watcher.set_dir(None);
+                self.watched_cwd = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_changes(&mut self, now: Instant) -> Result<Vec<ProviderChange>> {
+        let mut changes = Vec::new();
+
+        // 1. Drain watcher events.
+        for ev in self.watcher.drain() {
+            match ev {
+                SessionDirEvent::Changed(p) | SessionDirEvent::Removed(p) => {
+                    self.dirty_paths.insert(p);
+                    self.debounce_until = Some(now + TITLE_WATCH_DEBOUNCE);
+                }
+                SessionDirEvent::Rescan => {
+                    self.need_rescan = true;
+                    self.debounce_until = Some(now + TITLE_WATCH_DEBOUNCE);
+                }
+            }
+        }
+
+        // 2. Debounce flush.
+        if let Some(deadline) = self.debounce_until {
+            if now >= deadline {
+                self.debounce_until = None;
+                if self.need_rescan {
+                    self.need_rescan = false;
+                    self.dirty_paths.clear();
+                    changes.push(ProviderChange::Rescan);
+                } else if !self.dirty_paths.is_empty() {
+                    let paths: Vec<PathBuf> = self.dirty_paths.drain().collect();
+                    for path in paths {
+                        if path.exists() {
+                            if let Some(disk) = refresh_disk_session(&path) {
+                                let cwd = self
+                                    .watched_cwd
+                                    .clone()
+                                    .unwrap_or_else(|| PathBuf::from("."));
+                                changes.push(ProviderChange::Upsert(ProviderSession {
+                                    key: SessionKey::omp(&disk.id),
+                                    title: disk.title,
+                                    title_source: title_kind_to_source(disk.title_kind),
+                                    parent_ref: disk.parent_session,
+                                    path: Some(disk.path),
+                                    cwd,
+                                    modified_at: disk.mtime,
+                                    size: disk.size,
+                                }));
+                            }
+                        } else {
+                            // File removed — extract session id from stem.
+                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                let id = extract_session_id(stem);
+                                changes.push(ProviderChange::Removed(SessionKey::omp(&id)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback poll (3s) — catches changes missed by the watcher,
+        // including jsonl created in a legacy cwd bucket the primary watch
+        // does not cover.
+        if now.duration_since(self.last_poll) >= TITLE_FALLBACK_POLL {
+            self.last_poll = now;
+            if let Some(cwd) = self.watched_cwd.clone() {
+                if let Ok(listed) = list_omp_sessions(&self.sessions_root(), &cwd) {
+                    let listed_paths: HashSet<PathBuf> =
+                        listed.iter().map(|d| d.path.clone()).collect();
+                    let known_paths: HashSet<PathBuf> =
+                        self.known_sessions.keys().cloned().collect();
+                    if listed_paths != known_paths {
+                        self.known_sessions
+                            .retain(|path, _| listed_paths.contains(path));
+                        for d in &listed {
+                            self.known_sessions
+                                .insert(d.path.clone(), (d.mtime, d.size));
+                        }
+                        changes.push(ProviderChange::Rescan);
+                    } else {
+                        for d in listed {
+                            let changed = self
+                                .known_sessions
+                                .get(&d.path)
+                                .is_none_or(|(mtime, size)| d.mtime != *mtime || d.size != *size);
+                            if changed {
+                                self.known_sessions
+                                    .insert(d.path.clone(), (d.mtime, d.size));
+                                changes.push(ProviderChange::Upsert(ProviderSession {
+                                    key: SessionKey::omp(&d.id),
+                                    title: d.title,
+                                    title_source: title_kind_to_source(d.title_kind),
+                                    parent_ref: d.parent_session,
+                                    path: Some(d.path),
+                                    cwd: cwd.clone(),
+                                    modified_at: d.mtime,
+                                    size: d.size,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(changes)
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        // Earliest of debounce deadline and fallback poll deadline.
+        let debounce = self.debounce_until;
+        let fallback = Some(self.last_poll + TITLE_FALLBACK_POLL);
+        match (debounce, fallback) {
+            (Some(d), Some(f)) => Some(d.min(f)),
+            (d, f) => d.or(f),
+        }
+    }
+
+    fn load_transcript(&mut self, session: &ProviderSession) -> Result<Vec<TranscriptBlock>> {
+        let path = session
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("omp session has no path for transcript"))?;
+        Ok(crate::provider::transcript::omp::load(path))
+    }
+
+    fn modified_files_scanner(
+        &mut self,
+        session: &ProviderSession,
+    ) -> Result<Option<Box<dyn ModifiedFilesScanner>>> {
+        Ok(Some(Box::new(OmpModifiedFilesScanner {
+            scan: ModifiedFilesScan::new(&session.cwd),
+        })))
+    }
+}
+
 /// Primary omp v17.2.5+ session bucket for `cwd` (`home-{name}-{sha256}`).
 pub fn encode_cwd_key(cwd: &Path) -> String {
     session_dir_names(cwd).primary
@@ -166,10 +536,14 @@ fn session_dir_names(cwd: &Path) -> SessionDirNames {
     let canonical_temp = canonical_cwd(&temp);
 
     let (scope, legacy_relative) = if resolved.starts_with(&canonical_home) {
-        let rel = resolved.strip_prefix(&canonical_home).unwrap_or(Path::new(""));
+        let rel = resolved
+            .strip_prefix(&canonical_home)
+            .unwrap_or(Path::new(""));
         ("home", Some(encode_legacy_relative("-", rel)))
     } else if resolved.starts_with(&canonical_temp) {
-        let rel = resolved.strip_prefix(&canonical_temp).unwrap_or(Path::new(""));
+        let rel = resolved
+            .strip_prefix(&canonical_temp)
+            .unwrap_or(Path::new(""));
         ("tmp", Some(encode_legacy_relative("-tmp", rel)))
     } else {
         ("abs", None)
@@ -179,7 +553,11 @@ fn session_dir_names(cwd: &Path) -> SessionDirNames {
     let digest = sha256_hex(&normalized);
     let primary = format!(
         "{scope}-{}-{digest}",
-        if readable.is_empty() { "project" } else { &readable }
+        if readable.is_empty() {
+            "project"
+        } else {
+            &readable
+        }
     );
     let legacy_absolute = encode_legacy_absolute(&resolved);
 
@@ -195,9 +573,7 @@ fn canonical_cwd(cwd: &Path) -> PathBuf {
 }
 
 fn encode_legacy_relative(prefix: &str, relative: &Path) -> String {
-    let encoded = relative
-        .to_string_lossy()
-        .replace(['/', '\\', ':'], "-");
+    let encoded = relative.to_string_lossy().replace(['/', '\\', ':'], "-");
     if encoded.is_empty() {
         prefix.to_string()
     } else if prefix.ends_with('-') {
@@ -334,14 +710,12 @@ pub fn delete_session_with_artifacts(session_path: &Path) -> Result<()> {
 
 fn remove_session_paths(session_path: &Path, artifacts: &Path) -> Result<()> {
     if session_path.exists() {
-        fs::remove_file(session_path).with_context(|| {
-            format!("remove session file {}", session_path.display())
-        })?;
+        fs::remove_file(session_path)
+            .with_context(|| format!("remove session file {}", session_path.display()))?;
     }
     if artifacts.exists() {
-        fs::remove_dir_all(artifacts).with_context(|| {
-            format!("remove artifacts dir {}", artifacts.display())
-        })?;
+        fs::remove_dir_all(artifacts)
+            .with_context(|| format!("remove artifacts dir {}", artifacts.display()))?;
     }
     Ok(())
 }
@@ -378,9 +752,7 @@ fn read_parent_session(path: &Path) -> Option<String> {
     if header.kind != "session" {
         return None;
     }
-    header
-        .parent_session
-        .filter(|p| !p.trim().is_empty())
+    header.parent_session.filter(|p| !p.trim().is_empty())
 }
 
 /// Official slot → first user message → fallback id.
@@ -389,7 +761,10 @@ pub fn resolve_display_title(path: &Path, fallback_id: &str) -> (String, TitleKi
         return (t, TitleKind::Official);
     }
     if let Some(t) = read_first_user_message(path) {
-        return (truncate_chars(&t, PROVISIONAL_MAX_CHARS), TitleKind::Provisional);
+        return (
+            truncate_chars(&t, PROVISIONAL_MAX_CHARS),
+            TitleKind::Provisional,
+        );
     }
     (fallback_id.to_string(), TitleKind::Fallback)
 }
@@ -406,8 +781,8 @@ pub fn sanitize_session_title(value: &str) -> Option<String> {
 pub fn write_session_title(path: &Path, title: &str) -> Result<()> {
     let title = sanitize_session_name(Some(title)).context("empty session title")?;
     let updated_at = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-    let slot = serialize_title_slot(&title, Some("user"), &updated_at)
-        .context("serialize title slot")?;
+    let slot =
+        serialize_title_slot(&title, Some("user"), &updated_at).context("serialize title slot")?;
 
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut head = [0u8; TITLE_SLOT_BYTES];
@@ -445,8 +820,7 @@ pub fn write_session_title(path: &Path, title: &str) -> Result<()> {
 
     let tmp = path.with_extension("jsonl.amux-title-tmp");
     {
-        let mut out = File::create(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
+        let mut out = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         out.write_all(&slot)?;
         out.write_all(&rest)?;
         out.flush()?;
@@ -475,11 +849,7 @@ fn is_fixed_title_slot(head: &[u8; TITLE_SLOT_BYTES]) -> bool {
 }
 
 /// Build omp's fixed-width title slot (exactly [`TITLE_SLOT_BYTES`] including trailing newline).
-fn serialize_title_slot(
-    title: &str,
-    source: Option<&str>,
-    updated_at: &str,
-) -> Result<Vec<u8>> {
+fn serialize_title_slot(title: &str, source: Option<&str>, updated_at: &str) -> Result<Vec<u8>> {
     let truncated = truncate_title_for_slot(title, source, updated_at)?;
     let unpadded = title_slot_line(&truncated, source, updated_at, "");
     let unpadded_len = unpadded.len();
@@ -490,10 +860,7 @@ fn serialize_title_slot(
     let line = title_slot_line(&truncated, source, updated_at, &" ".repeat(pad_len));
     let bytes = line.into_bytes();
     if bytes.len() != TITLE_SLOT_BYTES {
-        bail!(
-            "title slot length {} != {TITLE_SLOT_BYTES}",
-            bytes.len()
-        );
+        bail!("title slot length {} != {TITLE_SLOT_BYTES}", bytes.len());
     }
     Ok(bytes)
 }
@@ -511,11 +878,7 @@ fn title_slot_line(title: &str, source: Option<&str>, updated_at: &str, pad: &st
     format!("{}\n", Value::Object(obj))
 }
 
-fn truncate_title_for_slot(
-    title: &str,
-    source: Option<&str>,
-    updated_at: &str,
-) -> Result<String> {
+fn truncate_title_for_slot(title: &str, source: Option<&str>, updated_at: &str) -> Result<String> {
     let chars: Vec<char> = title.chars().collect();
     let mut low = 0usize;
     let mut high = chars.len();
@@ -654,10 +1017,7 @@ fn extract_text_content(content: &Value) -> Option<String> {
 fn sanitize_session_name(value: Option<&str>) -> Option<String> {
     let value = value?;
     let first_line = value.lines().next().unwrap_or("");
-    let stripped: String = first_line
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect();
+    let stripped: String = first_line.chars().filter(|c| !c.is_control()).collect();
     let trimmed = stripped.trim();
     if trimmed.is_empty() {
         None
@@ -670,7 +1030,10 @@ fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+    format!(
+        "{}…",
+        s.chars().take(max.saturating_sub(1)).collect::<String>()
+    )
 }
 
 fn extract_session_id(stem: &str) -> String {
@@ -709,7 +1072,11 @@ mod which {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::api::{AgentProvider, ProviderChange, ProviderId};
+    use crate::provider::registry::ProviderRegistry;
+    use crate::session::{SessionSummaryChange, SessionSupervisor};
     use std::io::{Read, Write};
+    use std::time::Duration;
 
     fn write_title_slot(path: &Path, title: &str) {
         let slot = serialize_title_slot(title, None, "2026-08-01T00:00:00.000Z").unwrap();
@@ -766,10 +1133,16 @@ mod tests {
 
     #[test]
     fn extract_id_from_stem() {
-        let id = extract_session_id(
-            "2026-07-27T02-58-31-899Z_019fa182-7f5b-7000-a63a-2352a49dbca2",
-        );
+        let id =
+            extract_session_id("2026-07-27T02-58-31-899Z_019fa182-7f5b-7000-a63a-2352a49dbca2");
         assert_eq!(id, "019fa182-7f5b-7000-a63a-2352a49dbca2");
+        assert_eq!(extract_session_id("just-an-id"), "just-an-id");
+        assert_eq!(extract_session_id("short_ab"), "short_ab");
+        assert_eq!(extract_session_id("nounderscore"), "nounderscore");
+        assert_eq!(
+            extract_session_id("prefix_0123456789abcdef"),
+            "0123456789abcdef"
+        );
     }
 
     #[test]
@@ -796,7 +1169,10 @@ mod tests {
 
         write_session_title(&path, "新名字").unwrap();
         let after = fs::metadata(&path).unwrap().len();
-        assert_eq!(before, after, "in-place slot write must not change file length");
+        assert_eq!(
+            before, after,
+            "in-place slot write must not change file length"
+        );
 
         let (title, kind) = resolve_display_title(&path, "abc");
         assert_eq!(kind, TitleKind::Official);
@@ -813,11 +1189,7 @@ mod tests {
     fn write_session_title_prepends_legacy_header() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.jsonl");
-        fs::write(
-            &path,
-            format!("{}\n", r#"{"type":"session","id":"abc"}"#),
-        )
-        .unwrap();
+        fs::write(&path, format!("{}\n", r#"{"type":"session","id":"abc"}"#)).unwrap();
 
         write_session_title(&path, "legacy rename").unwrap();
         let (title, kind) = resolve_display_title(&path, "abc");
@@ -833,10 +1205,13 @@ mod tests {
         let id = "019fbc08-4aff-7000-ba28-7e6c08ce05e7";
         assert!(parent_refers_to(id, id));
         assert!(parent_refers_to(
-            &format!("/home/admin/.omp/agent/sessions/x/2026-08-01T00-00-00-000Z_{id}.jsonl"),
+            &format!("/home/user/.omp/agent/sessions/x/2026-08-01T00-00-00-000Z_{id}.jsonl"),
             id
         ));
-        assert!(!parent_refers_to("019fbc08-4aff-7000-ba28-7e6c08ce05e8", id));
+        assert!(!parent_refers_to(
+            "019fbc08-4aff-7000-ba28-7e6c08ce05e8",
+            id
+        ));
     }
 
     #[test]
@@ -894,5 +1269,626 @@ mod tests {
         assert_eq!(list.len(), 1, "orphan dir must not appear as a session");
         assert_eq!(list[0].title, "Keep Me");
         assert!(!list[0].id.contains("orphan"));
+    }
+
+    // --- SPI contract tests (§4.4) ---
+
+    fn make_provider() -> OmpProvider {
+        OmpProvider {
+            omp_bin: "omp".to_string(),
+            session_dir_override: None,
+            profile: None,
+            pi_pins: vec![
+                ("PI_FORCE_IMAGE_PROTOCOL".into(), "off".into()),
+                ("PI_NO_DECCARA".into(), "1".into()),
+                ("PI_NO_KITTY_PLACEHOLDERS".into(), "1".into()),
+                ("PI_TUI_SYNC_OUTPUT".into(), "1".into()),
+            ],
+            activity: SessionActivityTracker::default(),
+            watcher: SessionDirWatcher::spawn(),
+            dirty_paths: HashSet::new(),
+            debounce_until: None,
+            need_rescan: false,
+            last_poll: Instant::now(),
+            watched_cwd: None,
+            known_sessions: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn omp_new_spawn_spec_matches_legacy_argv() {
+        let p = make_provider();
+        let cwd = Path::new("/tmp/ws");
+        let spec = p.spawn_new(cwd).unwrap();
+        assert_eq!(spec.program, "omp");
+        assert_eq!(spec.args, vec!["--cwd", "/tmp/ws"]);
+        assert_eq!(spec.cwd, cwd);
+    }
+
+    #[test]
+    fn omp_resume_spawn_spec_matches_legacy_argv() {
+        let p = make_provider();
+        let cwd = Path::new("/tmp/ws");
+        let spec = p.spawn_resume(cwd, "abc-123").unwrap();
+        assert_eq!(spec.program, "omp");
+        assert_eq!(spec.args, vec!["--cwd", "/tmp/ws", "--resume", "abc-123"]);
+        assert_eq!(spec.cwd, cwd);
+    }
+
+    #[test]
+    fn omp_spawn_spec_preserves_default_pi_pins() {
+        let p = make_provider();
+        let spec = p.spawn_new(Path::new("/tmp/ws")).unwrap();
+        assert_eq!(spec.env.len(), 4);
+        let names: Vec<&str> = spec.env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"PI_FORCE_IMAGE_PROTOCOL"));
+        assert!(names.contains(&"PI_NO_DECCARA"));
+        assert!(names.contains(&"PI_NO_KITTY_PLACEHOLDERS"));
+        assert!(names.contains(&"PI_TUI_SYNC_OUTPUT"));
+        let vals: Vec<(&str, &str)> = spec
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert!(vals.contains(&("PI_FORCE_IMAGE_PROTOCOL", "off")));
+        assert!(vals.contains(&("PI_NO_DECCARA", "1")));
+        assert!(vals.contains(&("PI_NO_KITTY_PLACEHOLDERS", "1")));
+        assert!(vals.contains(&("PI_TUI_SYNC_OUTPUT", "1")));
+    }
+
+    #[test]
+    fn omp_spawn_spec_preserves_configured_pi_pins() {
+        let mut p = make_provider();
+        p.pi_pins = vec![("PI_CUSTOM".into(), "yes".into())];
+        let spec = p.spawn_new(Path::new("/tmp/ws")).unwrap();
+        assert_eq!(spec.env.len(), 1);
+        assert_eq!(spec.env[0].0, "PI_CUSTOM");
+        assert_eq!(spec.env[0].1, "yes");
+    }
+
+    #[test]
+    fn omp_spawn_spec_with_profile_and_session_dir() {
+        let mut p = make_provider();
+        p.profile = Some("dev".into());
+        p.session_dir_override = Some(PathBuf::from("/custom/sessions"));
+        let spec = p.spawn_new(Path::new("/tmp/ws")).unwrap();
+        assert_eq!(
+            spec.args,
+            vec![
+                "--cwd",
+                "/tmp/ws",
+                "--profile",
+                "dev",
+                "--session-dir",
+                "/custom/sessions"
+            ]
+        );
+        let resume = p.spawn_resume(Path::new("/tmp/ws"), "id1").unwrap();
+        assert_eq!(
+            resume.args,
+            vec![
+                "--cwd",
+                "/tmp/ws",
+                "--resume",
+                "id1",
+                "--profile",
+                "dev",
+                "--session-dir",
+                "/custom/sessions"
+            ]
+        );
+    }
+
+    #[test]
+    fn omp_live_rename_action_preserves_exact_bytes() {
+        let mut p = make_provider();
+        let session = ProviderSession {
+            key: SessionKey::omp("test-id"),
+            title: "old".into(),
+            title_source: TitleSource::Fallback,
+            parent_ref: None,
+            path: Some(PathBuf::from("/tmp/test.jsonl")),
+            cwd: PathBuf::from("/tmp"),
+            modified_at: Utc::now(),
+            size: 0,
+        };
+        let action = p.rename_live(&session, "new title").unwrap();
+        match action {
+            LiveRenameAction::WritePty(bytes) => {
+                assert_eq!(bytes, b"\x15/rename new title\r");
+            }
+            LiveRenameAction::Persisted => panic!("expected WritePty for omp live rename"),
+        }
+    }
+
+    #[test]
+    fn omp_normalize_title_preserves_existing_rules() {
+        let p = make_provider();
+        // First line only
+        assert_eq!(p.normalize_title("first\nsecond").unwrap(), "first");
+        // Control chars stripped
+        assert_eq!(p.normalize_title("hello\x07world").unwrap(), "helloworld");
+        // Trim
+        assert_eq!(p.normalize_title("  hello  ").unwrap(), "hello");
+        // All-whitespace rejected
+        assert!(p.normalize_title("   ").is_err());
+        // Empty rejected
+        assert!(p.normalize_title("").is_err());
+        // None rejected
+        assert!(p.normalize_title("\n\n").is_err());
+    }
+
+    #[test]
+    fn omp_capabilities_are_all_true() {
+        let p = make_provider();
+        let caps = p.capabilities();
+        assert!(caps.rename);
+        assert!(caps.delete);
+        assert!(caps.transcript);
+        assert!(caps.modified_files);
+        assert!(caps.live_rebind);
+    }
+
+    #[test]
+    fn omp_provider_id_is_stable() {
+        let p = make_provider();
+        assert_eq!(p.id().as_str(), "omp");
+        assert_eq!(p.display_name(), "omp");
+    }
+
+    fn write_official_jsonl(path: &Path, title: &str, parent: Option<&str>) {
+        write_title_slot(path, title);
+        let mut f = File::options().append(true).open(path).unwrap();
+        match parent {
+            Some(parent) => {
+                writeln!(f, r#"{{"type":"session","parentSession":"{parent}"}}"#).unwrap()
+            }
+            None => writeln!(f, r#"{{"type":"session"}}"#).unwrap(),
+        }
+    }
+
+    fn session_jsonl_path(sessions_root: &Path, cwd: &Path, id: &str) -> PathBuf {
+        let key = encode_cwd_key(cwd);
+        let sess_dir = sessions_root.join(key);
+        fs::create_dir_all(&sess_dir).unwrap();
+        sess_dir.join(format!("2026-08-01T00-00-00-000Z_{id}.jsonl"))
+    }
+
+    #[test]
+    fn omp_maps_disk_session_without_losing_metadata() {
+        let sessions_root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let id = "019fa182-7f5b-7000-a63a-2352a49dbca2";
+        let parent = "019fparent-0000-7000-ba28-7e6c08ce05e7";
+        let path = session_jsonl_path(sessions_root.path(), cwd.path(), id);
+        write_official_jsonl(&path, "Official Title", Some(parent));
+        let meta = fs::metadata(&path).unwrap();
+        let expected_mtime = system_time_to_utc(meta.modified().unwrap());
+        let expected_size = meta.len();
+
+        let mut p = make_provider();
+        p.session_dir_override = Some(sessions_root.path().to_path_buf());
+        let listed = AgentProvider::list_sessions(&mut p, cwd.path()).unwrap();
+        assert_eq!(listed.len(), 1);
+        let session = &listed[0];
+        assert_eq!(session.key.session_id, id);
+        assert_eq!(session.title, "Official Title");
+        assert_eq!(session.title_source, TitleSource::Official);
+        assert_eq!(session.parent_ref.as_deref(), Some(parent));
+        assert_eq!(session.path.as_deref(), Some(path.as_path()));
+        assert_eq!(session.cwd, cwd.path());
+        assert_eq!(session.modified_at, expected_mtime);
+        assert_eq!(session.size, expected_size);
+
+        let spec = p.spawn_resume(cwd.path(), &session.key.session_id).unwrap();
+        assert_eq!(spec.args[2], "--resume");
+        assert_eq!(spec.args[3], id);
+
+        assert!(p.modified_files_scanner(session).unwrap().is_some());
+    }
+
+    #[test]
+    fn omp_stored_rename_preserves_title_slot_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        write_title_slot(&path, "old");
+        let mut f = File::options().append(true).open(&path).unwrap();
+        writeln!(f, r#"{{"type":"session","id":"abc"}}"#).unwrap();
+        drop(f);
+        let before = fs::metadata(&path).unwrap().len();
+
+        let mut p = make_provider();
+        let session = ProviderSession {
+            key: SessionKey::omp("abc"),
+            title: "old".into(),
+            title_source: TitleSource::Official,
+            parent_ref: None,
+            path: Some(path.clone()),
+            cwd: dir.path().to_path_buf(),
+            modified_at: Utc::now(),
+            size: before,
+        };
+        p.rename_stored(&session, "新名字").unwrap();
+        let after = fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            before, after,
+            "in-place slot write must not change file length"
+        );
+        let (title, kind) = resolve_display_title(&path, "abc");
+        assert_eq!(kind, TitleKind::Official);
+        assert_eq!(title, "新名字");
+    }
+
+    #[test]
+    fn omp_delete_preserves_artifact_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("2026-08-01T00-00-00-000Z_abc.jsonl");
+        let artifacts = dir.path().join("2026-08-01T00-00-00-000Z_abc");
+        fs::write(&jsonl, b"{}\n").unwrap();
+        fs::create_dir_all(artifacts.join("nested")).unwrap();
+        fs::write(artifacts.join("nested/x.bin"), b"x").unwrap();
+
+        let mut p = make_provider();
+        let session = ProviderSession {
+            key: SessionKey::omp("abc"),
+            title: "abc".into(),
+            title_source: TitleSource::Fallback,
+            parent_ref: None,
+            path: Some(jsonl.clone()),
+            cwd: dir.path().to_path_buf(),
+            modified_at: Utc::now(),
+            size: 3,
+        };
+        p.delete_stored(&session).unwrap();
+        assert!(!jsonl.exists());
+        assert!(!artifacts.exists());
+    }
+
+    #[test]
+    fn omp_external_occupant_uses_resume_prefix_matching() {
+        let id = "019fa182-7f5b-7000-a63a-2352a49dbca2";
+        let cases: &[(&str, &str, &str, Option<&str>)] = &[
+            (
+                "--resume",
+                "1234 omp --cwd /tmp --resume 019fa182-7f5b-7000-a63a-2352a49dbca2\n",
+                id,
+                Some("1234 omp --cwd /tmp --resume 019fa182-7f5b-7000-a63a-2352a49dbca2"),
+            ),
+            (
+                "-r value",
+                "1234 omp -r 019fa182-7f5b-7000-a63a-2352a49dbca2\n",
+                id,
+                Some("1234 omp -r 019fa182-7f5b-7000-a63a-2352a49dbca2"),
+            ),
+            (
+                "-r=value",
+                "1234 omp -r=019fa182-7f5b-7000-a63a-2352a49dbca2\n",
+                id,
+                Some("1234 omp -r=019fa182-7f5b-7000-a63a-2352a49dbca2"),
+            ),
+            (
+                "different session no match",
+                "1234 omp --resume ffffffff-1111-2222-3333-444444444444\n",
+                id,
+                None,
+            ),
+            (
+                "amux own process line skipped",
+                "999 /usr/bin/amux --resume 019fa182-7f5b-7000-a63a-2352a49dbca2\n",
+                id,
+                None,
+            ),
+            (
+                "first valid match among multiple lines",
+                "999 amux helper --resume 019fa182-7f5b-7000-a63a-2352a49dbca2\n\
+                 1234 omp --resume 019fa182-7f5b-7000-a63a-2352a49dbca2\n\
+                 5678 omp --resume 019fa182-7f5b-7000-a63a-2352a49dbca2\n",
+                id,
+                Some("1234 omp --resume 019fa182-7f5b-7000-a63a-2352a49dbca2"),
+            ),
+        ];
+        for (name, process_list, session_id, expect) in cases {
+            assert_eq!(
+                parse_external_omp_resume(process_list, session_id).as_deref(),
+                *expect,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn omp_watch_modify_emits_upsert_after_debounce() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "019fa182-bbbb-7000-a63a-2352a49dbca2";
+        let path = dir
+            .path()
+            .join(format!("2026-08-01T00-00-00-000Z_{id}.jsonl"));
+        write_official_jsonl(&path, "Watched", None);
+
+        let mut p = make_provider();
+        let now = Instant::now();
+        p.watched_cwd = Some(dir.path().to_path_buf());
+        p.dirty_paths.insert(path);
+        p.debounce_until = Some(now + TITLE_WATCH_DEBOUNCE);
+        p.last_poll = now;
+        p.need_rescan = false;
+
+        assert!(p.poll_changes(now).unwrap().is_empty());
+        let changes = p.poll_changes(now + TITLE_WATCH_DEBOUNCE).unwrap();
+        match changes.as_slice() {
+            [ProviderChange::Upsert(session)] => {
+                assert_eq!(session.key.session_id, id);
+            }
+            other => panic!("expected one Upsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn omp_watch_create_delete_or_overflow_emits_rescan() {
+        let mut p = make_provider();
+        let now = Instant::now();
+        p.need_rescan = true;
+        p.debounce_until = Some(now);
+        p.last_poll = now;
+        let changes = p.poll_changes(now).unwrap();
+        assert!(
+            changes.iter().any(|c| matches!(c, ProviderChange::Rescan)),
+            "expected Rescan, got {changes:?}"
+        );
+    }
+
+    #[test]
+    fn omp_watch_switch_workspace_drops_old_workspace_events() {
+        let sessions_root = tempfile::tempdir().unwrap();
+        let cwd_a = tempfile::tempdir().unwrap();
+        let cwd_b = tempfile::tempdir().unwrap();
+        let id = "019fa182-cccc-7000-a63a-2352a49dbca2";
+        let path_a = session_jsonl_path(sessions_root.path(), cwd_a.path(), id);
+        write_official_jsonl(&path_a, "Workspace A", None);
+        fs::create_dir_all(sessions_root.path().join(encode_cwd_key(cwd_b.path()))).unwrap();
+
+        let mut p = make_provider();
+        p.session_dir_override = Some(sessions_root.path().to_path_buf());
+        p.select_workspace(Some(cwd_a.path())).unwrap();
+        p.dirty_paths.insert(path_a);
+        p.debounce_until = Some(Instant::now() + TITLE_WATCH_DEBOUNCE);
+        p.need_rescan = true;
+
+        p.select_workspace(Some(cwd_b.path())).unwrap();
+        assert!(p.dirty_paths.is_empty());
+        assert!(p.debounce_until.is_none());
+        assert!(!p.need_rescan);
+
+        let now = Instant::now();
+        p.last_poll = now;
+        let changes = p.poll_changes(now).unwrap();
+        for change in &changes {
+            if let ProviderChange::Upsert(session) = change {
+                assert_ne!(
+                    session.key.session_id, id,
+                    "old workspace upsert leaked after switch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn omp_watch_fallback_poll_detects_changed_fingerprint() {
+        let sessions_root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let id = "019fa182-dddd-7000-a63a-2352a49dbca2";
+        let path = session_jsonl_path(sessions_root.path(), cwd.path(), id);
+        write_official_jsonl(&path, "Before", None);
+
+        let mut p = make_provider();
+        p.session_dir_override = Some(sessions_root.path().to_path_buf());
+        let now = Instant::now();
+        p.watched_cwd = Some(cwd.path().to_path_buf());
+        p.last_poll = now;
+        let listed = AgentProvider::list_sessions(&mut p, cwd.path()).unwrap();
+        assert_eq!(listed.len(), 1);
+        let old_size = listed[0].size;
+
+        let mut f = File::options().append(true).open(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"message","message":{{"role":"user","content":"x"}}}}"#
+        )
+        .unwrap();
+        drop(f);
+        let new_size = fs::metadata(&path).unwrap().len();
+        assert_ne!(old_size, new_size);
+
+        let changes = p.poll_changes(now + Duration::from_secs(4)).unwrap();
+        match changes.as_slice() {
+            [ProviderChange::Upsert(session)] => {
+                assert_eq!(session.key.session_id, id);
+                assert_eq!(session.size, new_size);
+            }
+            other => panic!("expected fallback Upsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn omp_watch_fallback_poll_detects_new_session() {
+        let sessions_root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let first = "019fa182-dddd-7000-a63a-2352a49dbca2";
+        let second = "019fa182-eeee-7000-a63a-2352a49dbca2";
+        write_official_jsonl(
+            &session_jsonl_path(sessions_root.path(), cwd.path(), first),
+            "One",
+            None,
+        );
+
+        let mut p = make_provider();
+        p.session_dir_override = Some(sessions_root.path().to_path_buf());
+        let now = Instant::now();
+        p.watched_cwd = Some(cwd.path().to_path_buf());
+        p.last_poll = now;
+        assert_eq!(
+            AgentProvider::list_sessions(&mut p, cwd.path())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        write_official_jsonl(
+            &session_jsonl_path(sessions_root.path(), cwd.path(), second),
+            "Two",
+            Some(first),
+        );
+        let changes = p.poll_changes(now + Duration::from_secs(4)).unwrap();
+        assert!(
+            changes.iter().any(|c| matches!(c, ProviderChange::Rescan)),
+            "expected Rescan for a new jsonl, got {changes:?}"
+        );
+    }
+
+    #[test]
+    fn omp_watch_next_deadline_matches_existing_debounce() {
+        let mut p = make_provider();
+        let now = Instant::now();
+        p.last_poll = now;
+        p.debounce_until = Some(now + TITLE_WATCH_DEBOUNCE);
+        assert_eq!(
+            p.next_deadline(),
+            Some((now + TITLE_WATCH_DEBOUNCE).min(now + TITLE_FALLBACK_POLL))
+        );
+    }
+
+    #[test]
+    fn omp_watch_change_flows_through_supervisor_summary() {
+        let sessions_root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let id = "019fa182-eeee-7000-a63a-2352a49dbca2";
+        let path = session_jsonl_path(sessions_root.path(), cwd.path(), id);
+        write_official_jsonl(&path, "Before", None);
+
+        let mut provider = make_provider();
+        provider.session_dir_override = Some(sessions_root.path().to_path_buf());
+
+        let mut registry = ProviderRegistry::empty_for_test(ProviderId::OMP);
+        registry.register(Box::new(provider)).unwrap();
+        let mut supervisor = SessionSupervisor::from_registry_for_test(registry);
+
+        let listed = supervisor
+            .select_provider_workspace(ProviderId::OMP, "ws-a", Some(cwd.path()))
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key.session_id, id);
+        assert_eq!(listed[0].title, "Before");
+
+        write_session_title(&path, "After").unwrap();
+        let mut f = File::options().append(true).open(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"message","message":{{"role":"user","content":"x"}}}}"#
+        )
+        .unwrap();
+        drop(f);
+        let size_after = fs::metadata(&path).unwrap().len();
+        let mtime_after = system_time_to_utc(fs::metadata(&path).unwrap().modified().unwrap());
+
+        let now = Instant::now();
+        let changes = supervisor
+            .poll_provider_changes(now + Duration::from_secs(4))
+            .unwrap();
+        let summary = changes.iter().find_map(|c| match c {
+            SessionSummaryChange::Upsert { summary, .. } => Some(summary),
+            _ => None,
+        });
+        let summary = summary.expect("session is known after select; expected Upsert");
+        assert_eq!(summary.key.session_id, id);
+        assert_eq!(summary.title, "After");
+        assert_eq!(summary.size, size_after);
+        assert_eq!(summary.mtime, mtime_after);
+    }
+
+    #[test]
+    fn omp_watch_delete_emits_removed_after_debounce() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "019fa182-bbbb-7000-a63a-2352a49dbca2";
+        let path = dir
+            .path()
+            .join(format!("2026-08-01T00-00-00-000Z_{id}.jsonl"));
+        write_official_jsonl(&path, "Watched", None);
+
+        let mut p = make_provider();
+        let now = Instant::now();
+        p.watched_cwd = Some(dir.path().to_path_buf());
+        p.dirty_paths.insert(path.clone());
+        p.debounce_until = Some(now + TITLE_WATCH_DEBOUNCE);
+        p.last_poll = now;
+        p.need_rescan = false;
+
+        fs::remove_file(&path).unwrap();
+
+        assert!(p.poll_changes(now).unwrap().is_empty());
+        let changes = p.poll_changes(now + TITLE_WATCH_DEBOUNCE).unwrap();
+        match changes.as_slice() {
+            [ProviderChange::Removed(key)] => {
+                assert_eq!(*key, SessionKey::omp(id));
+            }
+            other => panic!("expected one Removed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn omp_spi_errors_when_session_path_is_none() {
+        let mut p = make_provider();
+        let session = ProviderSession {
+            key: SessionKey::omp("s1"),
+            title: "s1".into(),
+            title_source: TitleSource::Fallback,
+            parent_ref: None,
+            path: None,
+            cwd: PathBuf::from("/tmp"),
+            modified_at: Utc::now(),
+            size: 0,
+        };
+        let rename_err = p.rename_stored(&session, "x").unwrap_err().to_string();
+        assert!(rename_err.contains("no path"), "{rename_err}");
+        let delete_err = p.delete_stored(&session).unwrap_err().to_string();
+        assert!(delete_err.contains("no path"), "{delete_err}");
+        let load_err = p.load_transcript(&session).unwrap_err().to_string();
+        assert!(load_err.contains("no path"), "{load_err}");
+    }
+
+    #[test]
+    fn omp_watch_next_deadline_falls_back_to_poll_interval() {
+        let mut p = make_provider();
+        let now = Instant::now();
+        p.debounce_until = None;
+        p.last_poll = now;
+        assert_eq!(p.next_deadline(), Some(now + TITLE_FALLBACK_POLL));
+    }
+
+    #[test]
+    fn omp_available_errors_when_binary_missing() {
+        let mut p = make_provider();
+        p.omp_bin = "/nonexistent/omp-missing-bin".to_string();
+        let err = p.available().unwrap_err().to_string();
+        assert!(err.contains("omp not found"), "{err}");
+        assert!(err.contains("/nonexistent/omp-missing-bin"), "{err}");
+    }
+
+    #[test]
+    fn resolve_provisional_from_string_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        write_title_slot(&path, "");
+        let mut f = File::options().append(true).open(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"message","message":{{"role":"user","content":"hello world"}}}}"#
+        )
+        .unwrap();
+
+        let (title, kind) = resolve_display_title(&path, "abc");
+        assert_eq!(
+            (title.as_str(), kind),
+            ("hello world", TitleKind::Provisional)
+        );
     }
 }

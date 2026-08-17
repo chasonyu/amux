@@ -1,5 +1,8 @@
-//! Session occupation: flock under `~/.amux/locks/` + best-effort pgrep.
+//! Session occupation: flock under `~/.amux/locks/`.
 //! Process-level single-instance lock with replace-on-start.
+//!
+//! [`SessionLock`] only manages amux's own flock — it no longer knows about
+//! the `omp` command. External occupant detection lives in [`crate::provider::omp`].
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -16,6 +19,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 
 use crate::config::AmuxConfig;
+use crate::provider::api::SessionKey;
 
 pub struct SessionLock {
     _file: File,
@@ -23,11 +27,20 @@ pub struct SessionLock {
 }
 
 impl SessionLock {
-    /// Try to acquire exclusive non-blocking flock for `session_id`.
-    pub fn try_acquire(session_id: &str) -> Result<Self> {
+    /// Try to acquire exclusive non-blocking flock for `key`.
+    ///
+    /// OMP keys use the legacy `<sanitized-id>.lock` filename so new and old
+    /// amux versions compete on the same flock. Non-OMP providers use
+    /// `<provider>--<sanitized-id>.lock`.
+    pub fn try_acquire(key: &SessionKey) -> Result<Self> {
         AmuxConfig::ensure_dirs()?;
-        let safe = sanitize_id(session_id);
-        let path = AmuxConfig::locks_dir().join(format!("{safe}.lock"));
+        let safe = sanitize_id(&key.session_id);
+        let filename = if key.provider == crate::provider::api::ProviderId::OMP {
+            format!("{safe}.lock")
+        } else {
+            format!("{}--{safe}.lock", key.provider.as_str())
+        };
+        let path = AmuxConfig::locks_dir().join(filename);
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -71,46 +84,6 @@ fn sanitize_id(id: &str) -> String {
             }
         })
         .collect()
-}
-
-/// Best-effort: refuse if an external `omp -r` / `--resume` for this id is running.
-pub fn pgrep_external_omp_resume(session_id: &str) -> Option<String> {
-    let prefix = if session_id.len() > 8 {
-        &session_id[..8]
-    } else {
-        session_id
-    };
-    let output = Command::new("pgrep")
-        .args(["-af", "omp"])
-        .output()
-        .ok()?;
-    if !output.status.success() && output.stdout.is_empty() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        let resume_hit =
-            lower.contains("--resume") || lower.contains(" -r ") || lower.contains(" -r=");
-        if resume_hit && line.contains(prefix) {
-            // Ignore our own process line if it somehow matches
-            if lower.contains("amux") {
-                continue;
-            }
-            return Some(line.trim().to_string());
-        }
-    }
-    None
-}
-
-pub fn check_occupiable(session_id: &str) -> Result<()> {
-    if let Some(line) = pgrep_external_omp_resume(session_id) {
-        bail!(
-            "session appears occupied by external omp:\n  {line}\n\
-             Attach refused (no force-hijack)."
-        );
-    }
-    Ok(())
 }
 
 /// Held for process lifetime — exclusive amux instance lock.
@@ -185,7 +158,8 @@ fn try_flock_exclusive(file: &File) -> std::result::Result<(), ()> {
 
 fn write_pid(file: &mut File) -> Result<()> {
     file.set_len(0).context("truncate instance lock")?;
-    file.seek(SeekFrom::Start(0)).context("seek instance lock")?;
+    file.seek(SeekFrom::Start(0))
+        .context("seek instance lock")?;
     let pid = std::process::id();
     write!(file, "{pid}\n").context("write instance pid")?;
     file.flush().context("flush instance lock")?;
@@ -292,10 +266,50 @@ pub fn try_instance_lock() -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::api::{ProviderId, SessionKey};
 
     #[test]
     fn sanitize_keeps_uuidish() {
         assert_eq!(sanitize_id("019f-abc_1"), "019f-abc_1");
         assert_eq!(sanitize_id("a/b"), "a_b");
+    }
+
+    #[test]
+    fn omp_lock_path_preserves_legacy_filename() {
+        let key = SessionKey::omp("test-uuid-123");
+        let lock = SessionLock::try_acquire(&key).unwrap();
+        let path = lock.path().to_path_buf();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(filename, "test-uuid-123.lock");
+        drop(lock);
+    }
+
+    #[test]
+    fn same_session_id_uses_distinct_provider_lock_paths() {
+        let omp_key = SessionKey::omp("shared-id");
+        let fake_key = SessionKey::new(ProviderId::new("fake"), "shared-id");
+
+        let omp_lock = SessionLock::try_acquire(&omp_key).unwrap();
+        let fake_lock = SessionLock::try_acquire(&fake_key).unwrap();
+
+        let omp_name = omp_lock.path().file_name().unwrap().to_str().unwrap();
+        let fake_name = fake_lock.path().file_name().unwrap().to_str().unwrap();
+
+        assert_eq!(omp_name, "shared-id.lock");
+        assert_eq!(fake_name, "fake--shared-id.lock");
+        assert_ne!(omp_lock.path(), fake_lock.path());
+    }
+
+    #[test]
+    fn session_lock_still_rejects_second_holder() {
+        let key = SessionKey::omp("reject-second-test");
+        let lock1 = SessionLock::try_acquire(&key).unwrap();
+        // Second non-blocking flock for the same key should fail.
+        let result = SessionLock::try_acquire(&key);
+        assert!(result.is_err());
+        drop(lock1);
+        // After releasing, a new lock can be acquired.
+        let lock2 = SessionLock::try_acquire(&key);
+        assert!(lock2.is_ok());
     }
 }

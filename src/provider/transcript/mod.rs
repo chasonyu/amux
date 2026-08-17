@@ -1,13 +1,12 @@
-//! Agent-neutral transcript blocks + provider dispatch.
+//! Agent-neutral transcript blocks + renderer.
 //!
-//! Shell loads [`TranscriptBlock`] via [`load`] and draws with [`render`].
+//! Providers load [`TranscriptBlock`] via their own parsers (OMP:
+//! [`omp::load`]); Shell draws with [`render_blocks`].
 
 mod markdown;
-mod omp;
+pub(crate) mod omp;
 mod render;
 mod util;
-
-use std::path::Path;
 
 pub use markdown::{render_markdown, MdKind, MdLine};
 pub use omp::ModifiedFilesScan;
@@ -48,10 +47,17 @@ pub enum ToolKind {
 
 #[derive(Debug, Clone)]
 pub enum TranscriptBlock {
-    User { text: String, synthetic: bool },
-    Assistant { text: String },
+    User {
+        text: String,
+        synthetic: bool,
+    },
+    Assistant {
+        text: String,
+    },
     /// Already one-line; body discarded at parse.
-    Thinking { summary: String },
+    Thinking {
+        summary: String,
+    },
     Tool {
         name: String,
         title: String,
@@ -65,9 +71,14 @@ pub enum TranscriptBlock {
         status: ToolStatus,
     },
     /// Compaction divider, unknown-provider notice, etc.
-    Meta { text: String },
+    Meta {
+        text: String,
+    },
     /// omp custom_message: typed label + markdown body.
-    Custom { custom_type: String, content: String },
+    Custom {
+        custom_type: String,
+        content: String,
+    },
     Spacer,
 }
 
@@ -159,24 +170,6 @@ pub(crate) fn clamp_hunk_text(text: &str) -> String {
         end -= 1;
     }
     format!("{}\n… (hunk truncated)\n", &text[..end])
-}
-
-/// Load neutral transcript blocks for `provider` from `path`.
-pub fn load(provider: &str, path: &Path) -> Vec<TranscriptBlock> {
-    match provider {
-        "omp" => omp::load(path),
-        other => vec![TranscriptBlock::Meta {
-            text: format!("(no transcript preview for provider `{other}`)"),
-        }],
-    }
-}
-
-/// Incremental scanner over a provider session's modified files.
-pub fn modified_files_scan(provider: &str, cwd: &Path) -> Option<ModifiedFilesScan> {
-    match provider {
-        "omp" => Some(ModifiedFilesScan::new(cwd)),
-        _ => None,
-    }
 }
 
 /// Rendered diff lines kept for one file; the panel shows one screenful, so
@@ -285,13 +278,6 @@ fn lcs_diff(old: &str, new: &str, out: &mut Vec<DiffLine>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn unknown_provider_placeholder() {
-        let b = load("other", Path::new("/nope"));
-        assert!(matches!(&b[0], TranscriptBlock::Meta { text } if text.contains("other")));
-    }
 
     #[test]
     fn replace_hunk_emits_add_del_context() {
