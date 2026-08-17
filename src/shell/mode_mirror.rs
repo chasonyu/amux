@@ -50,13 +50,17 @@ impl KbNegotiated {
     }
 }
 
-/// Full mouse-off restore for process exit / panic teardown.
-/// Do **not** use for Nav focus — see [`apply_nav_host_modes`].
+/// Full host-mode restore for process exit / panic teardown.
+///
+/// Includes Mode 2031 off: while armed, the host may push
+/// `\x1b[?997;{1=dark,2=light}n`; if those bytes survive into cooked mode the
+/// shell shows a literal `997;2n` (CSI prefix consumed). Do **not** use for Nav
+/// focus — see [`apply_nav_host_modes`].
 pub fn baseline_host_modes(out: &mut impl Write) -> Result<()> {
-    // Disable mouse, bracketed paste, focus, alt-scroll — exit restore.
+    // Mode 2031 off, then mouse / bracketed paste / focus / alt-scroll off.
     write!(
         out,
-        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1007l"
+        "\x1b[?2031l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1007l"
     )?;
     out.flush()?;
     Ok(())
@@ -127,3 +131,22 @@ pub fn apply_host_modes(out: &mut impl Write, modes: &MirroredModes) -> Result<(
     out.flush()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baseline_disables_mode_2031_before_mouse_off() {
+        let mut buf = Vec::new();
+        baseline_host_modes(&mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("\x1b[?2031l"), "exit restore must disable Mode 2031: {s:?}");
+        assert!(s.contains("\x1b[?1000l"), "exit restore must disable mouse: {s:?}");
+        assert!(
+            s.find("\x1b[?2031l").unwrap() < s.find("\x1b[?1000l").unwrap(),
+            "2031l should come before mouse-off so theme DSRs stop first: {s:?}"
+        );
+    }
+}
+

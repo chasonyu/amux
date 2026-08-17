@@ -54,12 +54,14 @@ fn main() -> Result<()> {
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut out = io::stdout();
-        let _ = disable_raw_mode();
+        // Prefer restoring modes while still raw so in-flight Mode 2031 / OSC
+        // replies are less likely to echo as cooked input. Order mirrors the
+        // normal `App::run` teardown (2031l is inside baseline_host_modes).
+        let _ = amux::shell::mode_mirror::baseline_host_modes(&mut out);
         // Pop kitty keyboard disambiguation if amux armed it. (no-op if unset)
         let _ = write!(out, "\x1b[<u");
-        // Exit restore: disable mouse / bracketed paste / focus.
-        let _ = amux::shell::mode_mirror::baseline_host_modes(&mut out);
         let _ = execute!(out, LeaveAlternateScreen, Show);
+        let _ = disable_raw_mode();
         prev_hook(info);
     }));
 

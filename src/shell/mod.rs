@@ -307,15 +307,30 @@ impl App {
         let result = self.run_inner(&mut stdout, stdin_fd);
 
         // Teardown — restores terminal on every exit path. (§4.2.10 / E14)
+        //
+        // Mode 2031 must be disabled *before* the (possibly slow) child kill
+        // ladder, and any already-queued theme DSRs / late OSC replies must be
+        // drained while still in raw mode. Otherwise the host pushes
+        // `\x1b[?997;2n` (light) with nobody reading, and after
+        // `disable_raw_mode` the shell paints a literal `997;2n`.
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b[?2031l");
+        let _ = out.flush();
+
         self.sessions.shutdown_all_blocking();
+
+        // Still raw: discard leftovers that arrived before disable or during
+        // shutdown (buffered 2031 DSR, OSC 11 from a theme re-query, DA1).
+        let mut stdin = io::stdin();
+        drain_pending_input(stdin_fd, &mut stdin, Duration::from_millis(150));
         let _ = set_nonblocking(stdin_fd, false);
-        let _ = write!(io::stdout(), "\x1b[?2031l"); // Mode 2031 off
-        let _ = baseline_host_modes(&mut io::stdout());
+
+        let _ = baseline_host_modes(&mut out);
         if self.kb.kitty {
-            let _ = write!(io::stdout(), "\x1b[<u");
+            let _ = write!(out, "\x1b[<u");
         }
         let _ = execute!(
-            io::stdout(),
+            out,
             DisableBracketedPaste,
             DisableMouseCapture,
             Show,
@@ -3804,6 +3819,41 @@ fn set_nonblocking(fd: i32, on: bool) -> Result<()> {
     Ok(())
 }
 
+/// Discard pending host input while still in raw mode.
+///
+/// Uses poll + read (no sticky `O_NONBLOCK` on the shared tty OFD). Stops after
+/// ~30ms of quiet or when `budget` elapses — enough to catch a delayed Mode
+/// 2031 DSR / OSC 11 reply without hanging exit.
+fn drain_pending_input(fd: i32, input: &mut impl Read, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    let mut buf = [0u8; 1024];
+    let mut quiet_rounds = 0u32;
+    while Instant::now() < deadline {
+        let wait = Duration::from_millis(10)
+            .min(deadline.saturating_duration_since(Instant::now()));
+        match poll_fd(fd, wait) {
+            Ok(true) => {
+                quiet_rounds = 0;
+                match input.read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => return,
+                }
+            }
+            Ok(false) => {
+                quiet_rounds += 1;
+                if quiet_rounds >= 3 {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 fn poll_fd(fd: i32, timeout: Duration) -> Result<bool> {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use std::os::fd::BorrowedFd;
@@ -4032,6 +4082,33 @@ mod selection_cache_tests {
     fn busy_to_idle_marks_unread_only_when_not_watching_same_key() {
         assert!(!busy_to_idle_should_mark_unread(true));
         assert!(busy_to_idle_should_mark_unread(false));
+    }
+
+    #[test]
+    fn drain_pending_input_consumes_mode2031_dsr() {
+        use super::drain_pending_input;
+        use std::fs::File;
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::time::Duration;
+
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        let mut wr = File::from(write_fd);
+        let mut rd = File::from(read_fd);
+
+        // Host theme report that previously leaked as literal `997;2n`.
+        wr.write_all(b"\x1b[?997;2n").unwrap();
+        drop(wr);
+
+        let fd = rd.as_raw_fd();
+        drain_pending_input(fd, &mut rd, Duration::from_millis(100));
+        let mut rest = Vec::new();
+        rd.read_to_end(&mut rest).unwrap();
+        assert!(
+            rest.is_empty(),
+            "Mode 2031 DSR must be drained before cooked mode: {:?}",
+            String::from_utf8_lossy(&rest)
+        );
     }
 }
 
